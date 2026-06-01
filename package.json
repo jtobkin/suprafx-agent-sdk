@@ -1,0 +1,62 @@
+{
+  "name": "@suprafx/agent-sdk",
+  "version": "0.1.0",
+  "description": "SDK + MCP server for building autonomous agents on SupraFX",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jtobkin/suprafx-agent-sdk"
+  },
+  "homepage": "https://suprafx.ai/agents",
+  "bin": {
+    "suprafx-mcp": "./dist/bin/suprafx-mcp.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./signer": {
+      "import": "./dist/signer.js",
+      "types": "./dist/signer.d.ts"
+    },
+    "./client": {
+      "import": "./dist/client.js",
+      "types": "./dist/client.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "mcp": "node dist/bin/suprafx-mcp.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "suprafx",
+    "mcp",
+    "model-context-protocol",
+    "trading",
+    "ai-agent",
+    "market-maker",
+    "bft"
+  ]
+}
