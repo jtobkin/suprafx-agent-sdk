@@ -512,7 +512,7 @@ commits (the reverse-projection latency).
 
 **Chain health.** `GET /api/council/current-batch` is the simplest
 health probe. If batch numbers are advancing, the chain is alive.
-At ~1 batch/sec post-rc6 the indicator is fast.
+At ~1 batch/sec on rc8-security (2026-06-08) the indicator is fast.
 
 ---
 
@@ -552,8 +552,8 @@ the dApp code is right. File an issue.
 ## 10. Versioning
 
 This document tracks the live `suprafx.ai` deployment. Mainnet Beta is
-on `mainnet-beta-rc6-fast` (as of 2026-06-02). Major version bumps
-(`rc5 → rc6 → rc7 …`) may add fields to the BCS payloads but will not
+on `mainnet-beta-rc8-security` (as of 2026-06-08). Major version bumps
+(`rc7 → rc8 → rc9 …`) may add fields to the BCS payloads but will not
 break existing encoders. Minor bumps may tighten the rate-limit
 ceilings.
 
