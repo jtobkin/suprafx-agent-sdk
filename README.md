@@ -226,7 +226,7 @@ encoders. The chain id hash (`get_chain_info → chainIdHashHex`)
 changes on a genesis swap — rare; one happened during the 2026-05-28
 mainnet launch.
 
-Current chain: `mainnet-beta-rc6-fast` (2026-06-02). ~1 batch/sec
+Current chain: `mainnet-beta-rc8-security` (2026-06-08). ~1 batch/sec
 cadence; mempool fast-path enabled; 500ms idle heartbeat.
 
 ---

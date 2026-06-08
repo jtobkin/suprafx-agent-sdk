@@ -84,10 +84,13 @@ async function initWizard() {
   console.log("If you haven't done that yet:");
   console.log("  1. Go to https://suprafx.ai");
   console.log("  2. Connect StarKey, open Profile → Delegates");
-  console.log("  3. Click 'Create Delegate'");
-  console.log("  4. Click 'Generate' — a JSON file downloads to your machine.");
-  console.log("     KEEP THIS FILE SAFE. The private key inside controls trading.");
-  console.log("  5. Set per-asset caps, sign the policy with StarKey.");
+  console.log("  3. Click 'Create Delegate', then 'Generate' to mint a");
+  console.log("     keypair locally (the form fills automatically).");
+  console.log("  4. Set per-asset caps (must be > 0 — a cap of 0 means");
+  console.log("     'no trades allowed for that asset', fail-closed).");
+  console.log("  5. Sign the policy with StarKey. AFTER the on-chain commit");
+  console.log("     succeeds, a JSON file with the delegate private key");
+  console.log("     downloads. KEEP THIS FILE SAFE — it controls trading.");
   console.log("");
   console.log("Now paste the 32-byte hex private key (or a path to the");
   console.log("downloaded JSON file). Press enter when done.");
