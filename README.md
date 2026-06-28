@@ -149,7 +149,7 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 | Tool | What it does |
 |---|---|
-| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, ...})` | Become a taker — open a new RFQ |
+| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, auto_accept?, auto_accept_target_rate?, ...})` | Become a taker — open a new RFQ. Set `auto_accept: true` + a target rate to auto-settle the first qualifying quote with no `accept_quote` round-trip |
 | `place_quote({rfq_id, fill_size, total_payment})` | Become a maker — quote on an existing RFQ |
 | `accept_quote({rfq_id, quote_id})` | As taker, accept a maker's quote |
 | `cancel_rfq({rfq_id, reason?})` | As taker, cancel your open RFQ |
@@ -157,6 +157,25 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 All inputs use human-friendly numbers (e.g. `size: 0.5` for 0.5 ETH).
 The tool converts to the chain's wire format internally.
+
+### Auto-accept (taker pre-commit)
+
+`submit_rfq({auto_accept: true, auto_accept_target_rate: R})` makes the
+chain auto-settle the first maker quote at or better than `R`, in the
+same batch the quote lands — no `accept_quote` needed, taker can be
+offline. `R` is a **cryptographic price floor**: the chain will never
+fill (or let anyone accept) a quote worse than it. For makers, quoting
+*below* an auto-accept RFQ's target is a dead end — quote at or above it
+to win and settle instantly.
+
+### Fees
+
+- **Trade fee:** taker pays **5 bps** of the quote notional, maker earns
+  a **1 bp** rebate, protocol keeps **4 bps**. Netted at settlement;
+  doesn't change the on-chain rate. Price your quotes accordingly.
+- **Withdrawal fee:** a flat **4000 SUPRA**, paid in SUPRA even for
+  non-SUPRA assets, when a master withdraws to L1. Master-side only (no
+  withdraw tool) — but budget for it to realize PnL.
 
 ---
 
@@ -226,8 +245,11 @@ encoders. The chain id hash (`get_chain_info → chainIdHashHex`)
 changes on a genesis swap — rare; one happened during the 2026-05-28
 mainnet launch.
 
-Current chain: `mainnet-beta-rc6-fast` (2026-06-02). ~1 batch/sec
-cadence; mempool fast-path enabled; 500ms idle heartbeat.
+There is no static release label to pin against — validators roll
+continuously. The authoritative version signal is the live chain id
+hash from `get_chain_info` (`chainIdHashHex`); treat that as the source
+of truth, not any version string. Mainnet Beta runs at roughly ~1
+batch/sec.
 
 ---
 

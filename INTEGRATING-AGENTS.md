@@ -52,6 +52,43 @@ drain master funds beyond those bounds.
 
 You specify the mode per RFQ. Quotes inherit from the RFQ.
 
+**Auto-accept (taker pre-commit).** A taker can submit an RFQ with
+`auto_accept = true` and an `auto_accept_target_rate`. The chain then
+settles the FIRST maker quote whose rate is at or better than that
+target **automatically, in the same batch the quote lands** — no
+separate `AcceptQuote` is sent, and the taker can be completely offline.
+Two consequences every agent must internalize:
+
+- **For takers:** the target rate is a *cryptographic price floor*. The
+  chain will never auto-fire (and will never let anyone manually accept)
+  a quote worse than it — even if your session key is compromised. Set
+  it to the worst rate you're willing to take. `auto_accept = true` with
+  `auto_accept_target_rate = 0` is rejected at submit time.
+- **For makers:** quoting *below* an auto-accept RFQ's target is a dead
+  end — the chain refuses to accept it (manual or auto). To win an
+  auto-accept RFQ, quote at or above its target; you then settle
+  instantly with no taker round-trip. The target is public on the RFQ
+  payload (`auto_accept_target_rate`).
+
+**Fees.** Two deterministic fees apply. Model both or your PnL will be
+wrong.
+
+- *Trade fee.* Every settled trade charges the **taker 5 bps (0.05%)**
+  of the quote-asset notional and pays the **maker a 1 bp (0.01%)
+  rebate**; the protocol keeps the **4 bps** difference. The taker fee
+  is netted out of what the taker receives at settlement — it does NOT
+  change the on-chain `rate`, only the settled amounts. As a taker,
+  quote a rate that clears your costs plus the 5 bps; as a maker, fold
+  the +1 bp rebate into your edge.
+- *Withdrawal fee.* Moving funds OFF the platform to an L1 chain costs a
+  flat **4000 SUPRA**, enforced on-chain and **always paid in SUPRA** —
+  even when withdrawing a non-SUPRA asset. The master must hold ≥ 4000
+  SUPRA available (plus the principal if withdrawing SUPRA itself), or
+  the withdrawal is rejected. This is a master/dApp action, not an agent
+  trade — there is no withdraw tool in the SDK — but the humans behind
+  your agent need to budget for it to realize PnL. Trading never
+  triggers it.
+
 **Asset semantics.** Every asset on SupraFX is identified by a 32-byte
 `AssetId`, derived deterministically from `(canonical_chain_id,
 token_bytes)`. The canonical chain id is the bridge identifier
@@ -506,13 +543,15 @@ own RFQ. Two delegates owned by the same master can't trade with each
 other either.
 
 **Settlement timing.** A `Platform`-mode RFQ + accepted quote settles in
-the batch that includes the `AcceptQuote` event. Funds become
-available in `/api/platform/balances` ~3-5 seconds after that batch
-commits (the reverse-projection latency).
+the batch that includes the accepting event — the `AcceptQuote` for a
+manual accept, or the **`PlaceQuote` itself** for an auto-accept RFQ
+(the chain auto-fires in-place; no `AcceptQuote` is ever sent). Funds
+become available in `/api/platform/balances` ~3-5 seconds after that
+batch commits (the reverse-projection latency).
 
 **Chain health.** `GET /api/council/current-batch` is the simplest
 health probe. If batch numbers are advancing, the chain is alive.
-At ~1 batch/sec post-rc6 the indicator is fast.
+At roughly ~1 batch/sec the indicator advances quickly.
 
 ---
 
@@ -551,13 +590,19 @@ the dApp code is right. File an issue.
 
 ## 10. Versioning
 
-This document tracks the live `suprafx.ai` deployment. Mainnet Beta is
-on `mainnet-beta-rc6-fast` (as of 2026-06-02). Major version bumps
-(`rc5 → rc6 → rc7 …`) may add fields to the BCS payloads but will not
-break existing encoders. Minor bumps may tighten the rate-limit
-ceilings.
+This document tracks the live `suprafx.ai` **Mainnet Beta** deployment.
+There is no static release label to pin against — validators are rolled
+continuously, so the authoritative version signal is the **chain id
+hash** from `GET /api/council/chain-info` (`chainIdHashHex`). Treat that
+as the source of truth, not any version string in prose or in this doc.
 
-The chain id hash (`/api/council/chain-info → chainIdHashHex`) changes
-on a chain genesis swap (rare; one happened during the 2026-05-28
-mainnet launch). If your agent caches it, refetch on a `no_quorum`
-burst — that's the only signal an agent typically sees.
+New deploys may ADD fields to the BCS payloads but will not break
+existing encoders (BCS is append-only at the struct tail). If a
+previously-working envelope suddenly returns `decode_error`, refetch
+chain-info and update your vendored encoders against the schemas in
+`event-bcs.ts`.
+
+The chain id hash changes only on a chain genesis swap (rare; one
+happened during the 2026-05-28 mainnet launch). If your agent caches it,
+refetch on a `no_quorum` burst — that's the only signal an agent
+typically sees.
