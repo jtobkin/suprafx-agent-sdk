@@ -65,6 +65,29 @@ npx tsx 03-counter-arb-taker.ts
 listen → Accept). Pair with `01-passive-quoter` to see end-to-end
 matching.
 
+### `04-auto-accept-partial-taker.ts`
+
+A resting limit order — the two taker primitives composed. Submits one
+larger RFQ with `auto_accept: true` (every qualifying quote settles
+instantly on chain, no `accept_quote`, taker offline) **and**
+`allow_partial_fills: true` (it fills in slices and stays open until
+full). Then just watches the fills roll in, and cancels any unfilled
+remainder at the deadline.
+
+```bash
+SUPRAFX_DELEGATE_PRIV_HEX=0x... \
+PAIR=ETH/USDC \
+SELL_CHAIN=eth-mainnet SELL_TOKEN=ETH \
+BUY_CHAIN=eth-mainnet  BUY_TOKEN=USDC \
+SIZE=1.0 TARGET_RATE=2400 MIN_FILL=0.1 DEADLINE_MIN=10 \
+npx tsx 04-auto-accept-partial-taker.ts
+```
+
+**Good for:** hands-off execution at a price floor; absorbing maker
+liquidity incrementally; understanding how `auto_accept` +
+`allow_partial_fills` + `cancel_rfq` compose. `TARGET_RATE` is a hard
+floor — the chain never fills below it.
+
 ## Cost considerations
 
 Every accepted trade settles real assets. These examples have no

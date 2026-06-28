@@ -19,7 +19,7 @@ package implements those concepts.
 |---|---|---|
 | `@suprafx/agent-sdk` (the JS/TS lib) | Typed client + signer for the SupraFX REST endpoints | You're writing a custom agent in Node/TypeScript |
 | `suprafx-mcp` (the CLI binary) | An MCP server that exposes SupraFX as tools | You're using Claude Desktop, Cursor, Continue, or any MCP-aware AI agent |
-| `cookbook/` | 3 runnable example agents | You want a starting point you can fork |
+| `cookbook/` | 4 runnable example agents | You want a starting point you can fork |
 
 ---
 
@@ -149,11 +149,11 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 | Tool | What it does |
 |---|---|
-| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, auto_accept?, auto_accept_target_rate?, ...})` | Become a taker — open a new RFQ. Set `auto_accept: true` + a target rate to auto-settle the first qualifying quote with no `accept_quote` round-trip |
+| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, auto_accept?, auto_accept_target_rate?, allow_partial_fills?, min_fill_size?, ...})` | Become a taker — open a new RFQ. `auto_accept` auto-settles qualifying quotes; `allow_partial_fills` lets it fill in slices (see below) |
 | `place_quote({rfq_id, fill_size, total_payment})` | Become a maker — quote on an existing RFQ |
-| `accept_quote({rfq_id, quote_id})` | As taker, accept a maker's quote |
+| `accept_quote({quote_id, trade_id?})` | As taker, accept a maker's quote |
 | `cancel_rfq({rfq_id, reason?})` | As taker, cancel your open RFQ |
-| `withdraw_quote({rfq_id, quote_id})` | As maker, pull your pending quote |
+| `withdraw_quote({quote_id})` | As maker, pull your pending quote |
 
 All inputs use human-friendly numbers (e.g. `size: 0.5` for 0.5 ETH).
 The tool converts to the chain's wire format internally.
@@ -166,7 +166,30 @@ same batch the quote lands — no `accept_quote` needed, taker can be
 offline. `R` is a **cryptographic price floor**: the chain will never
 fill (or let anyone accept) a quote worse than it. For makers, quoting
 *below* an auto-accept RFQ's target is a dead end — quote at or above it
-to win and settle instantly.
+to win and settle instantly. (`auto_accept: false`, the default, keeps
+the taker in control: quotes accumulate and you `accept_quote` manually.)
+
+### Partial fills
+
+`submit_rfq({allow_partial_fills: true, min_fill_size: M})` lets makers
+fill a *slice* of the RFQ (≥ `M`) instead of all-or-nothing. After a
+partial fill the RFQ stays open with a smaller `remaining_size` and keeps
+taking quotes until full or cancelled. A maker who over-quotes is
+capped-and-filled to what remains — never over-locked.
+
+**Compose them.** `auto_accept: true` + `allow_partial_fills: true` is a
+resting limit order: one large RFQ that auto-settles every qualifying
+slice at or above your floor, incrementally, until full — taker offline.
+See `cookbook/04-auto-accept-partial-taker.ts`.
+
+### Order lifecycle (cancel & withdraw)
+
+- **`cancel_rfq({rfq_id, reason?})`** (taker) — pull an open RFQ; the
+  earmark is released and all its pending quotes are refunded + rejected.
+- **`withdraw_quote({quote_id})`** (maker) — pull a pending quote; the
+  lock is released. There's no "edit quote": to reprice, withdraw then
+  `place_quote` again. Refresh stale quotes promptly so you aren't picked
+  off at a price the market has left.
 
 ### Fees
 
@@ -202,7 +225,7 @@ inactive. Every subsequent envelope from the delegate is rejected.
 
 ## Cookbook
 
-[`cookbook/`](./cookbook/) ships three runnable examples:
+[`cookbook/`](./cookbook/) ships four runnable examples:
 
 - **`01-passive-quoter.ts`** — Quote at reference price + fixed spread
   on every RFQ for a pair. Simplest possible market maker.
@@ -211,6 +234,9 @@ inactive. Every subsequent envelope from the delegate is rejected.
 - **`03-counter-arb-taker.ts`** — Submits an RFQ then accepts any
   maker quote with edge ≥ a threshold. Demonstrates the full
   taker round-trip including timeout-and-cancel.
+- **`04-auto-accept-partial-taker.ts`** — A resting limit order:
+  `auto_accept` + `allow_partial_fills` on one RFQ, auto-filling in
+  slices at or above your floor, offline, with cancel-on-deadline.
 
 Run with `npx tsx cookbook/01-passive-quoter.ts` (after `npm install`
 in this directory).
