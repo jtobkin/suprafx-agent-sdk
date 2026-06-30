@@ -15,7 +15,7 @@
  *   npx tsx cookbook/02-inventory-aware-quoter.ts
  */
 
-import EventSource from "eventsource";
+import { EventSource } from "eventsource";
 import {
   SupraFxClient,
   DelegateSigner,
@@ -26,17 +26,28 @@ import {
 const PAIR = process.env.PAIR ?? "ETH/USDC";
 const BASE_SPREAD_BPS = Number(process.env.BASE_SPREAD_BPS ?? 15);
 const MAX_INVENTORY_PCT = Number(process.env.MAX_INVENTORY_PCT ?? 80);
-const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX!;
+const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
 const MASTER = process.env.MASTER_ADDRESS!;
 const BASE = process.env.SUPRAFX_BASE_URL ?? "https://suprafx.ai";
 
-if (!PRIV || !MASTER) {
-  console.error("SUPRAFX_DELEGATE_PRIV_HEX and MASTER_ADDRESS required");
+// Safety: placing a quote locks quote-asset funds. This runs in DRY_RUN
+// (observe the live book + real inventory, log every quote it WOULD
+// place, sign nothing) unless LIVE=1 is set explicitly.
+const DRY_RUN = process.env.LIVE !== "1";
+
+if (!MASTER) {
+  console.error("MASTER_ADDRESS required (read-only inventory lookups)");
+  process.exit(1);
+}
+if (!DRY_RUN && !PRIV) {
+  console.error("SUPRAFX_DELEGATE_PRIV_HEX required for a LIVE run");
   process.exit(1);
 }
 
 const client = new SupraFxClient({ baseUrl: BASE });
-const signer = new DelegateSigner({ delegatePrivKeyHex: PRIV, client });
+const signer = PRIV
+  ? new DelegateSigner({ delegatePrivKeyHex: PRIV, client })
+  : null;
 
 interface InventoryView {
   base: number;
@@ -64,9 +75,14 @@ function spreadBps(inv: InventoryView, refRate: number): number {
 }
 
 async function main() {
-  await signer.loadSequenceFromChain();
   console.log(
-    `[inventory-quoter] delegate=${signer.addressHex} pair=${PAIR}`,
+    DRY_RUN
+      ? `[inventory-quoter] DRY RUN — observing the live book + real inventory, no signing. Set LIVE=1 to trade with real funds.`
+      : `[inventory-quoter] LIVE — will place quotes with REAL funds.`,
+  );
+  if (signer) await signer.loadSequenceFromChain();
+  console.log(
+    `[inventory-quoter] delegate=${signer?.addressHex ?? "(none — dry run)"} pair=${PAIR}`,
   );
   const assets = await client.listAssets();
   const [baseSym, quoteSym] = PAIR.split("/");
@@ -104,8 +120,15 @@ async function main() {
     const bps = spreadBps(inv, ref);
     const quotedRate = ref * (1 - bps / 10000);
 
+    if (DRY_RUN) {
+      console.log(
+        `[inventory-quoter] DRY RUN: WOULD quote ${fillSize.toFixed(4)} ${baseSym} @ ${quotedRate.toFixed(4)} (spread ${bps.toFixed(1)}bps) — not signing.`,
+      );
+      return;
+    }
+
     try {
-      const r = await signer.placeQuote({
+      const r = await signer!.placeQuote({
         rfq_id: uuidToBytes16(rfq.id),
         quote_id: randomBytes16(),
         rate: toRateBFT(quotedRate, baseDec, quoteDec),
