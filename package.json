@@ -5,11 +5,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jtobkin/suprafx-agent-sdk"
+    "url": "git+https://github.com/jtobkin/suprafx-agent-sdk.git"
   },
   "homepage": "https://suprafx.ai/agents",
   "bin": {
-    "suprafx-mcp": "./dist/bin/suprafx-mcp.js"
+    "suprafx-mcp": "dist/bin/suprafx-mcp.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
