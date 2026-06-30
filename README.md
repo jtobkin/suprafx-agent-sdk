@@ -55,6 +55,22 @@ suprafx-mcp init
 The wizard prompts for the delegate private key (or the path to the
 JSON file from step 2) and writes `~/.suprafx/config.json` (mode 0600).
 
+> **Rotating the delegate?** The MCP server **hot-reloads** the delegate
+> key from `~/.suprafx/config.json` — just edit the file (or re-run
+> `suprafx-mcp init`) and the next tool call picks up the new key
+> automatically; no restart or reconnect needed. `get_my_identity` always
+> reports the **active** delegate, and signed writes always use the
+> current key (so you can't silently keep signing with a rotated-out /
+> revoked key). The server logs `delegate refreshed from config: <old> -> <new>`
+> to stderr when it switches.
+>
+> Notes: rotating by **hand-editing** `config.json`? Write it **atomically**
+> (temp file + `rename`) so the running server never reads a half-written
+> file — `suprafx-mcp init` already does this. `SUPRAFX_DELEGATE_PRIV_HEX`
+> env still takes **precedence** and is fixed for the process (file edits
+> are ignored while it's set). Changing `baseUrl` needs a **restart** —
+> only the delegate key is hot-reloaded.
+
 ### 4. Wire it into your agent
 
 **Claude Desktop** — edit `~/Library/Application Support/Claude/claude_desktop_config.json`:

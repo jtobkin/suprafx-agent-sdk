@@ -13,7 +13,7 @@
  *     responses, stderr for log lines.
  */
 
-import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -137,8 +137,14 @@ async function initWizard() {
   const cfgDir = join(homedir(), ".suprafx");
   mkdirSync(cfgDir, { recursive: true });
   const cfgPath = join(cfgDir, "config.json");
-  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-  chmodSync(cfgPath, 0o600);
+  // Atomic write (temp + rename): a running suprafx-mcp hot-reloads this
+  // file, so a truncate-then-write could be read mid-rotation as a partial
+  // (invalid JSON) and flip the server to read-only. Write to a temp file
+  // with 0600 first, then rename into place (atomic on the same filesystem).
+  const tmpPath = `${cfgPath}.tmp`;
+  writeFileSync(tmpPath, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  chmodSync(tmpPath, 0o600);
+  renameSync(tmpPath, cfgPath);
 
   console.log(`\n✓ Saved to ${cfgPath} (mode 600 — owner read/write only)`);
   console.log("");
