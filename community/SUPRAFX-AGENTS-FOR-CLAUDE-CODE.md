@@ -57,18 +57,28 @@ Claude cannot do these for you (they need your wallet / your money):
 1. **Install StarKey** (Supra wallet) and fund a **master account**.
 2. **Deposit at least one asset** under the master on https://suprafx.ai.
 3. **Authorize a delegate**: on suprafx.ai → **Profile → Delegates → Create
-   Delegate** → *Generate* a keypair → set **conservative caps** → **sign with
-   StarKey**. This downloads a delegate private-key JSON.
+   Delegate** → *Generate* (creates an ed25519 keypair locally and pre-fills the
+   form) → set **conservative caps** → **Sign the policy with StarKey**. The
+   `DelegatePolicyCreated` event commits on chain in ~1 second.
 
-   **Recommended first-run caps (start tiny, loosen later):**
-   - `max_trade_size`: ~`0.001 ETH` (or equivalent dollar value)
-   - `max_earmark_total`: ~`0.01 ETH`
-   - `expires_at_batch`: ~24h of batches (≈ `86_400`)
-   - Allowed pairs: just the one pair you're testing
+   **Recommended first-run caps (start tiny, loosen later).** Official fields:
+   - **Max trade size**: ~`0.001 ETH` (or a small dollar value)
+   - **Max cumulative earmark per asset**: ~`0.01 ETH`
+   - **Expiry batch**: ~24h of batches ahead (≈ `86_400`; cadence ~1 batch/sec)
+   - **Allowed pairs**: just the one pair you're testing
+
+   ⚠️ **Caps are fail-closed: a cap of `0` means "no trades allowed for that
+   asset."** Set every asset you want to trade to a small **positive** value.
+
+   ⚠️ **The private-key JSON downloads ONLY after the master signature commits
+   on chain — and it is the only copy.** There is no re-download. Back it up to a
+   safe place (a password manager / encrypted store) the moment it lands, then
+   pass it to `suprafx-mcp init` or your bot's env.
 
 The delegate **holds no funds** and **cannot exceed these caps**. If its key
 leaks, the damage is bounded and it auto-expires. You can revoke it instantly
-from Profile → Delegates → Deactivate.
+from Profile → Delegates → **Deactivate** — every subsequent envelope from that
+delegate is rejected within ~2 seconds.
 
 ---
 
@@ -144,6 +154,20 @@ things like *"What's on the ETH/USDC orderbook?"* or *"Submit an RFQ to sell 0.1
 ETH for USDC at $2400."* **You** confirm each trade — the key never leaves your
 machine (stdio transport, never networked). Skip `suprafx-mcp init` to run the
 read-only tools with no key at all.
+
+**The MCP exposes 12 tools — 7 always available (read-only, no signing), 5
+unlock once a delegate key is configured:**
+
+- Read (no key): current batch, sequence number, open orderbook/RFQs, your
+  delegate address, balances, chain info.
+- Write (needs key): `submit_rfq` (open RFQ as taker — locks sell-asset),
+  `place_quote` (quote as maker — locks quote-asset), `accept_quote` (taker
+  settles a maker's quote), `cancel_rfq` (taker withdraws, returns locked
+  funds), `withdraw_quote` (maker pulls a pending quote).
+
+> Not on Node? A third path skips the SDK entirely — sign and POST envelopes
+> yourself. Recipe: `delegate-bot-signing.md` (a focused subset of
+> `INTEGRATING-AGENTS.md §4`).
 
 ---
 
