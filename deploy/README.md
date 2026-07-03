@@ -24,7 +24,8 @@ MAX_PREMIUM_BPS=25
 # Optional safeguards:
 # MAX_SPEND_USDC=50     # soft session spend cap per asset (delegate cap = hard limit)
 # MAX_SPEND_USDT=50
-# QUOTE_TTL_MS=30000    # withdraw unmatched bids older than this
+# STALE_BUFFER_BPS=30   # re-price a resting bid only if oracle drops past this (else it rests to fill)
+# MAX_BID_AGE_MS=0      # optional absolute max bid age (0 = bids rest until filled)
 # POLL_MS=2000          # orderbook poll cadence
 # LIVE=1                # <-- uncomment ONLY when you're funded + caps enabled and ready to trade
 ```

@@ -176,6 +176,18 @@ Non-obvious things that cost real debugging time:
    `body.ok`; read `detail` for the human-readable reason. See the error
    catalog in §7.
 
+7. **Re-sync your sequence number periodically, or a long-running agent
+   will silently wedge.** A write returns `ok: true` from the mempool
+   *before* the chain validates it. The SDK optimistically advances its
+   local sequence counter on `ok: true`, so if a write doesn't commit,
+   the counter drifts **ahead** of the chain — and from then on every
+   write is rejected **silently** (`ok: true`, no `batch`, no fill). The
+   symptom: the agent logs successful sends but the delegate's on-chain
+   `events_seen` (`/api/council/sequence-number?address=…`) stops
+   advancing. The fix: call `signer.loadSequenceFromChain()` on a cadence
+   (e.g. once per poll cycle). Cheap, and it self-heals any drift. Don't
+   rely on the one-time sync at startup.
+
 ---
 
 ## 2. The dApp endpoints
