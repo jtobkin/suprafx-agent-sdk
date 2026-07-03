@@ -15,7 +15,7 @@
  * the pair (you're locking quote_asset on every quote).
  */
 
-import EventSource from "eventsource";
+import { EventSource } from "eventsource";
 import { SupraFxClient, DelegateSigner } from "../src/index.js";
 
 const PAIR = process.env.PAIR ?? "ETH/USDC";
@@ -23,18 +23,30 @@ const SPREAD_BPS = Number(process.env.SPREAD_BPS ?? 10);
 const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
 const BASE = process.env.SUPRAFX_BASE_URL ?? "https://suprafx.ai";
 
-if (!PRIV) {
-  console.error("SUPRAFX_DELEGATE_PRIV_HEX env var required");
+// Safety: placing a quote locks quote-asset funds. This runs in DRY_RUN
+// (observe the live book, log every quote it WOULD place, sign nothing)
+// unless LIVE=1 is set explicitly.
+const DRY_RUN = process.env.LIVE !== "1";
+
+if (!DRY_RUN && !PRIV) {
+  console.error("SUPRAFX_DELEGATE_PRIV_HEX required for a LIVE run");
   process.exit(1);
 }
 
 const client = new SupraFxClient({ baseUrl: BASE });
-const signer = new DelegateSigner({ delegatePrivKeyHex: PRIV, client });
+const signer = PRIV
+  ? new DelegateSigner({ delegatePrivKeyHex: PRIV, client })
+  : null;
 
 async function main() {
-  await signer.loadSequenceFromChain();
   console.log(
-    `[passive-quoter] delegate=${signer.addressHex} pair=${PAIR} spread=${SPREAD_BPS}bps`,
+    DRY_RUN
+      ? `[passive-quoter] DRY RUN — observing the live book, no signing/submitting. Set LIVE=1 to trade with real funds.`
+      : `[passive-quoter] LIVE — will place quotes with REAL funds.`,
+  );
+  if (signer) await signer.loadSequenceFromChain();
+  console.log(
+    `[passive-quoter] delegate=${signer?.addressHex ?? "(none — dry run)"} pair=${PAIR} spread=${SPREAD_BPS}bps`,
   );
 
   const es = new (EventSource as any)(
@@ -83,8 +95,15 @@ async function main() {
       // wrapper around DelegateSigner.placeQuote that takes
       // (fillSize, totalPayment, baseDec, quoteDec) and does the
       // toMicroUnits / toRateBFT conversion.
+      if (DRY_RUN) {
+        console.log(
+          `[passive-quoter] DRY RUN: WOULD quote ${fillSize} ${baseSym} @ ${quotedRate.toFixed(6)} (pays ${totalPayment.toFixed(4)} ${quoteSym}) — not signing.`,
+        );
+        return;
+      }
+
       const { toMicroUnits, toRateBFT } = await import("../src/index.js");
-      const result = await signer.placeQuote({
+      const result = await signer!.placeQuote({
         rfq_id: uuidToBytes16(rfq.id),
         quote_id: randomBytes16(),
         rate: toRateBFT(quotedRate, baseDec, quoteDec),

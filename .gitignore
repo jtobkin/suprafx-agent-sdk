@@ -5,3 +5,11 @@ dist/
 .env
 .env.*
 ~/.suprafx/
+# Never commit delegate private keys (downloaded JSON, MCP config, etc.)
+.suprafx/
+config.json
+*.key
+*delegate*.json
+*-private-key*.json
+deploy/*.env
+deploy/.env*
