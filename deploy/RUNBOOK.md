@@ -14,7 +14,7 @@ npx pm2 logs supra-accumulator --lines 100 --nostream   # recent history
 What the log lines mean:
 - `✓ bid to buy N SUPRA for X USDC …` — a real quote landed on the book.
 - `↩ withdrew stale bid on … (age Ns)` — an unmatched bid past
-  `QUOTE_TTL_MS` was pulled so it wouldn't sit at a stale price.
+  a resting bid was re-priced because the oracle moved past `STALE_BUFFER_BPS`.
 - `rejected … gate_rejected: …` — the delegate policy blocked it; read
   the `detail` (see Troubleshooting).
 - `📊 session: +N SUPRA accumulated; spent X USDC, … ; open bids K` —
@@ -71,7 +71,7 @@ npx pm2 delete supra-accumulator
 | earmark / cumulative | hit the delegate earmark cap | raise cap (hard limit) |
 | asset not allowed | that quote asset's cap is disabled (deny-default) | enable it in Delegates |
 | expired | delegate policy past its expiry batch | create a fresh delegate |
-| rate_limited | >~1 write/sec | raise `POLL_MS` / `QUOTE_TTL_MS` |
+| rate_limited | >~1 write/sec | raise `POLL_MS` |
 | auth / sequence | key or seq mismatch | restart re-aligns the sequence |
 
 ## Keep it alive
