@@ -43,7 +43,7 @@ SUPRA.
 
 ---
 
-## ⭐ Flagship: `04-bullish-supra-accumulator.ts`
+## ⭐ Flagship: `05-bullish-supra-accumulator.ts`
 
 **Accumulate SUPRA at a fair price.** Watches `SUPRA/USDC`,
 `SUPRA/USDT`, `SUPRA/ETH` for anyone selling SUPRA and bids to **buy**
@@ -55,12 +55,12 @@ sized to your available balance. This is the bullish default.
 MASTER_ADDRESS=0x... \
 QUOTE_ASSETS=USDC,USDT,ETH \
 MAX_PREMIUM_BPS=25 \
-npx tsx 04-bullish-supra-accumulator.ts
+npx tsx 05-bullish-supra-accumulator.ts
 
 # LIVE — add your delegate key + LIVE=1 to actually buy:
 SUPRAFX_DELEGATE_PRIV_HEX=0x... LIVE=1 \
 MASTER_ADDRESS=0x... QUOTE_ASSETS=USDC,USDT,ETH MAX_PREMIUM_BPS=25 \
-npx tsx 04-bullish-supra-accumulator.ts
+npx tsx 05-bullish-supra-accumulator.ts
 ```
 
 **Knobs:** `MAX_PREMIUM_BPS=0` buys only at oracle; a **negative** value
@@ -74,9 +74,9 @@ sellers without ever overpaying the oracle.
 
 ## Mechanics examples
 
-The three below teach the maker/taker plumbing. **As written, `01` and
+The four below teach the maker/taker plumbing. **As written, `01` and
 `02` quote the _sell-SUPRA_ side of a `<quote>/SUPRA` pair** — run them
-on a `SUPRA/<quote>` pair (or study `04`) if your intent is to buy.
+on a `SUPRA/<quote>` pair (or study `05`) if your intent is to buy.
 
 ### `01-passive-quoter.ts`
 Simplest maker. For every new RFQ on one pair, posts a quote at
@@ -108,6 +108,31 @@ SELL_CHAIN=eth-mainnet BUY_CHAIN=supra-mainnet \
 SIZE=2 REFERENCE_RATE=4054 MIN_EDGE_BPS=20 \
 npx tsx 03-counter-arb-taker.ts   # DRY_RUN
 ```
+
+---
+
+### `04-auto-accept-partial-taker.ts`
+
+A resting limit order — the two taker primitives composed. Submits one
+larger RFQ with `auto_accept: true` (every qualifying quote settles
+instantly on chain, no `accept_quote`, taker offline) **and**
+`allow_partial_fills: true` (it fills in slices and stays open until
+full). Then just watches the fills roll in, and cancels any unfilled
+remainder at the deadline.
+
+```bash
+SUPRAFX_DELEGATE_PRIV_HEX=0x... \
+PAIR=ETH/USDC \
+SELL_CHAIN=eth-mainnet SELL_TOKEN=ETH \
+BUY_CHAIN=eth-mainnet  BUY_TOKEN=USDC \
+SIZE=1.0 TARGET_RATE=2400 MIN_FILL=0.1 DEADLINE_MIN=10 \
+npx tsx 04-auto-accept-partial-taker.ts
+```
+
+**Good for:** hands-off execution at a price floor; absorbing maker
+liquidity incrementally; understanding how `auto_accept` +
+`allow_partial_fills` + `cancel_rfq` compose. `TARGET_RATE` is a hard
+floor — the chain never fills below it.
 
 ---
 

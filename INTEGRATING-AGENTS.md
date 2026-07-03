@@ -9,7 +9,7 @@ programmatic access. An agent that signs locally and POSTs to these
 endpoints is a first-class participant on the chain — the same path the
 official web dApp uses for every trade.
 
-If you only want to run a market maker, skip ahead to §6.
+If you only want to run a market maker, skip ahead to §7.
 
 ---
 
@@ -51,6 +51,73 @@ drain master funds beyond those bounds.
   swaps where the user wants L1 finality.
 
 You specify the mode per RFQ. Quotes inherit from the RFQ.
+
+**Auto-accept (taker pre-commit).** A taker can submit an RFQ with
+`auto_accept = true` and an `auto_accept_target_rate`. The chain then
+settles the FIRST maker quote whose rate is at or better than that
+target **automatically, in the same batch the quote lands** — no
+separate `AcceptQuote` is sent, and the taker can be completely offline.
+Two consequences every agent must internalize:
+
+- **For takers:** the target rate is a *cryptographic price floor*. The
+  chain will never auto-fire (and will never let anyone manually accept)
+  a quote worse than it — even if your session key is compromised. Set
+  it to the worst rate you're willing to take. `auto_accept = true` with
+  `auto_accept_target_rate = 0` is rejected at submit time.
+- **For makers:** quoting *below* an auto-accept RFQ's target is a dead
+  end — the chain refuses to accept it (manual or auto). To win an
+  auto-accept RFQ, quote at or above its target; you then settle
+  instantly with no taker round-trip. The target is public on the RFQ
+  payload (`auto_accept_target_rate`).
+
+`auto_accept = false` (the default) keeps the taker in control: quotes
+just accumulate on the book and the taker decides when (and whether) to
+`AcceptQuote`. Use `false` when you want to shop quotes; use `true` when
+you want hands-off execution at a known floor. See §6 for the full set
+of strategies these primitives unlock.
+
+**Partial fills.** By default an RFQ is all-or-nothing: a quote must fill
+the entire remaining size or it's rejected. Set `allow_partial_fills =
+true` (and a `min_fill_size`) to let makers fill a *slice*:
+
+- A maker may quote a `fill_size` anywhere from `min_fill_size` up to the
+  RFQ's remaining size. If a maker over-quotes (asks for more than
+  remains), the chain **caps-and-fills** to the remaining size — it never
+  over-locks the maker.
+- After a partial fill the RFQ **stays open** with a decremented
+  `remaining_size`, accepting further quotes until it's fully filled (or
+  cancelled). `min_fill_size` is your dust guard — it's the smallest
+  slice you'll accept, enforced on the *actual* settled amount.
+- This is what lets a single large RFQ be filled by many small makers.
+
+**Auto-accept + partial fills (compose them).** The two combine into the
+most powerful passive-taker pattern: submit one large RFQ with
+`auto_accept = true`, a target floor, AND `allow_partial_fills = true`.
+Now **every** maker quote that clears your floor (and meets
+`min_fill_size`) auto-settles its slice the instant it lands, and the
+RFQ keeps absorbing more until it's full — all with the taker offline,
+no per-fill clicks, every fill guaranteed at or better than your price.
+It's a resting limit order that fills incrementally against the maker
+crowd.
+
+**Fees.** Two deterministic fees apply. Model both or your PnL will be
+wrong.
+
+- *Trade fee.* Every settled trade charges the **taker 5 bps (0.05%)**
+  of the quote-asset notional and pays the **maker a 1 bp (0.01%)
+  rebate**; the protocol keeps the **4 bps** difference. The taker fee
+  is netted out of what the taker receives at settlement — it does NOT
+  change the on-chain `rate`, only the settled amounts. As a taker,
+  quote a rate that clears your costs plus the 5 bps; as a maker, fold
+  the +1 bp rebate into your edge.
+- *Withdrawal fee.* Moving funds OFF the platform to an L1 chain costs a
+  flat **4000 SUPRA**, enforced on-chain and **always paid in SUPRA** —
+  even when withdrawing a non-SUPRA asset. The master must hold ≥ 4000
+  SUPRA available (plus the principal if withdrawing SUPRA itself), or
+  the withdrawal is rejected. This is a master/dApp action, not an agent
+  trade — there is no withdraw tool in the SDK — but the humans behind
+  your agent need to budget for it to realize PnL. Trading never
+  triggers it.
 
 **Asset semantics.** Every asset on SupraFX is identified by a 32-byte
 `AssetId`, derived deterministically from `(canonical_chain_id,
@@ -375,7 +442,70 @@ constant per chain.
 
 ---
 
-## 6. A minimal market maker
+## 6. Core actions & strategies
+
+You now have every primitive. This section ties them into the strategy
+toolkit — the complete set of things an agent can do on SupraFX. There
+are no hidden order types: `auto_accept`, `allow_partial_fills`, and the
+cancel/withdraw pulls are the entire surface.
+
+### The five write actions
+
+| Action | Tool / event | Role | Effect |
+|---|---|---|---|
+| Open an RFQ | `submit_rfq` / `SubmitRfq` | taker | Earmarks the sell asset; posts a request to the book |
+| Quote an RFQ | `place_quote` / `PlaceQuote` | maker | Locks the quote asset; offers a fill (auto-settles if the RFQ is auto-accept and you clear its floor) |
+| Accept a quote | `accept_quote` / `AcceptQuote` | taker | Settles a chosen maker quote (not needed for auto-accept RFQs) |
+| Cancel an RFQ | `cancel_rfq` / `CancelRfq` | taker | Pulls your open RFQ; releases the earmark; refunds + rejects its pending quotes |
+| Withdraw a quote | `withdraw_quote` / `WithdrawQuote` | maker | Pulls your pending quote; releases its lock |
+
+### Managing open orders (cancel & withdraw)
+
+Lifecycle control is half of every real strategy. The two pull-actions:
+
+- **`cancel_rfq` (taker).** Cancels an *open* RFQ you own. The earmarked
+  sell balance returns to `available`, and every pending quote on it is
+  rejected and refunded. Use it on a timeout, on a price move that makes
+  your RFQ stale, or to free balance for a better opportunity. A
+  fully-filled RFQ can't be cancelled (nothing is open). Takes an
+  optional `reason` (logged on chain).
+- **`withdraw_quote` (maker).** Pulls a *pending* quote you placed; the
+  quote-asset lock returns to `available`. This is your reprice button —
+  there is no "edit quote": to move your price you `withdraw_quote` then
+  `place_quote` again at the new rate. Withdraw stale quotes promptly so
+  you're not filled at a price the market has already left.
+
+Both are owner-gated (only the funds owner / an authorized delegate can
+pull) and both commit in ~1-2 seconds.
+
+### The quote-refresh loop (makers)
+
+The canonical maker maintenance loop:
+
+1. `place_quote` at your current fair value.
+2. Watch the SSE feed + oracle. When your quote drifts past tolerance,
+   `withdraw_quote`.
+3. `place_quote` again at the new price.
+4. On fill, rebalance inventory and repeat.
+
+Skipping step 2 is how makers get picked off — a quote you forgot to
+withdraw is a free option you wrote for the market.
+
+### The strategy menu
+
+The primitives compose into the core strategies:
+
+| Strategy | How |
+|---|---|
+| **Passive market maker** | `place_quote` on incoming RFQs at reference ± spread; refresh on drift. (`cookbook/01`, `02`) |
+| **Aggressive taker / arb** | `submit_rfq` (`auto_accept = false`), watch quotes, `accept_quote` the best edge, `cancel_rfq` on timeout. (`cookbook/03`) |
+| **Hands-off limit order** | `submit_rfq` with `auto_accept = true` + a target floor — fills automatically at your price or better, taker offline. |
+| **Incremental fill (resting order)** | the same, plus `allow_partial_fills = true` + a `min_fill_size` — one large RFQ absorbs many small fills at/above your floor until full. (`cookbook/04`) |
+| **Liquidity working (maker)** | quote partial `fill_size`s across many open RFQs to work into a position without sweeping any single book. |
+
+Every one of these is just the five write actions arranged differently.
+
+## 7. A minimal market maker
 
 This skeleton demonstrates the full loop: read the orderbook, decide,
 quote.
@@ -485,7 +615,7 @@ This is intentionally minimal. Real market makers add:
 
 ---
 
-## 7. Error catalog
+## 8. Error catalog
 
 Every write endpoint returns `{ok, code, detail, per_validator}` on
 non-success. Most common rejections an agent will see:
@@ -524,7 +654,7 @@ Specific `detail` strings that often catch agents off guard:
 
 ---
 
-## 8. Operational notes
+## 9. Operational notes
 
 **Rate limits.** The dApp ingress rate-limits POSTs to the council
 endpoints at a level that comfortably supports a single agent making
@@ -551,17 +681,19 @@ own RFQ. Two delegates owned by the same master can't trade with each
 other either.
 
 **Settlement timing.** A `Platform`-mode RFQ + accepted quote settles in
-the batch that includes the `AcceptQuote` event. Funds become
-available in `/api/platform/balances` ~3-5 seconds after that batch
-commits (the reverse-projection latency).
+the batch that includes the accepting event — the `AcceptQuote` for a
+manual accept, or the **`PlaceQuote` itself** for an auto-accept RFQ
+(the chain auto-fires in-place; no `AcceptQuote` is ever sent). Funds
+become available in `/api/platform/balances` ~3-5 seconds after that
+batch commits (the reverse-projection latency).
 
 **Chain health.** `GET /api/council/current-batch` is the simplest
 health probe. If batch numbers are advancing, the chain is alive.
-At ~1 batch/sec post-rc6 the indicator is fast.
+At roughly ~1 batch/sec the indicator advances quickly.
 
 ---
 
-## 9. Where the canonical code lives
+## 10. Where the canonical code lives
 
 The dApp's own trading flows use the same endpoints documented here.
 Authoritative reference implementations:
@@ -594,15 +726,21 @@ the dApp code is right. File an issue.
 
 ---
 
-## 10. Versioning
+## 11. Versioning
 
-This document tracks the live `suprafx.ai` deployment. Mainnet Beta is
-on `mainnet-beta-rc6-fast` (as of 2026-06-02). Major version bumps
-(`rc5 → rc6 → rc7 …`) may add fields to the BCS payloads but will not
-break existing encoders. Minor bumps may tighten the rate-limit
-ceilings.
+This document tracks the live `suprafx.ai` **Mainnet Beta** deployment.
+There is no static release label to pin against — validators are rolled
+continuously, so the authoritative version signal is the **chain id
+hash** from `GET /api/council/chain-info` (`chainIdHashHex`). Treat that
+as the source of truth, not any version string in prose or in this doc.
 
-The chain id hash (`/api/council/chain-info → chainIdHashHex`) changes
-on a chain genesis swap (rare; one happened during the 2026-05-28
-mainnet launch). If your agent caches it, refetch on a `no_quorum`
-burst — that's the only signal an agent typically sees.
+New deploys may ADD fields to the BCS payloads but will not break
+existing encoders (BCS is append-only at the struct tail). If a
+previously-working envelope suddenly returns `decode_error`, refetch
+chain-info and update your vendored encoders against the schemas in
+`event-bcs.ts`.
+
+The chain id hash changes only on a chain genesis swap (rare; one
+happened during the 2026-05-28 mainnet launch). If your agent caches it,
+refetch on a `no_quorum` burst — that's the only signal an agent
+typically sees.

@@ -55,6 +55,22 @@ suprafx-mcp init
 The wizard prompts for the delegate private key (or the path to the
 JSON file from step 2) and writes `~/.suprafx/config.json` (mode 0600).
 
+> **Rotating the delegate?** The MCP server **hot-reloads** the delegate
+> key from `~/.suprafx/config.json` — just edit the file (or re-run
+> `suprafx-mcp init`) and the next tool call picks up the new key
+> automatically; no restart or reconnect needed. `get_my_identity` always
+> reports the **active** delegate, and signed writes always use the
+> current key (so you can't silently keep signing with a rotated-out /
+> revoked key). The server logs `delegate refreshed from config: <old> -> <new>`
+> to stderr when it switches.
+>
+> Notes: rotating by **hand-editing** `config.json`? Write it **atomically**
+> (temp file + `rename`) so the running server never reads a half-written
+> file — `suprafx-mcp init` already does this. `SUPRAFX_DELEGATE_PRIV_HEX`
+> env still takes **precedence** and is fixed for the process (file edits
+> are ignored while it's set). Changing `baseUrl` needs a **restart** —
+> only the delegate key is hot-reloaded.
+
 ### 4. Wire it into your agent
 
 **Claude Desktop** — edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -149,14 +165,56 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 | Tool | What it does |
 |---|---|
-| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, ...})` | Become a taker — open a new RFQ |
+| `submit_rfq({sell_chain, sell_token, buy_chain, buy_token, size, reference_price, auto_accept?, auto_accept_target_rate?, allow_partial_fills?, min_fill_size?, ...})` | Become a taker — open a new RFQ. `auto_accept` auto-settles qualifying quotes; `allow_partial_fills` lets it fill in slices (see below) |
 | `place_quote({rfq_id, fill_size, total_payment})` | Become a maker — quote on an existing RFQ |
-| `accept_quote({rfq_id, quote_id})` | As taker, accept a maker's quote |
+| `accept_quote({quote_id, trade_id?})` | As taker, accept a maker's quote |
 | `cancel_rfq({rfq_id, reason?})` | As taker, cancel your open RFQ |
-| `withdraw_quote({rfq_id, quote_id})` | As maker, pull your pending quote |
+| `withdraw_quote({quote_id})` | As maker, pull your pending quote |
 
 All inputs use human-friendly numbers (e.g. `size: 0.5` for 0.5 ETH).
 The tool converts to the chain's wire format internally.
+
+### Auto-accept (taker pre-commit)
+
+`submit_rfq({auto_accept: true, auto_accept_target_rate: R})` makes the
+chain auto-settle the first maker quote at or better than `R`, in the
+same batch the quote lands — no `accept_quote` needed, taker can be
+offline. `R` is a **cryptographic price floor**: the chain will never
+fill (or let anyone accept) a quote worse than it. For makers, quoting
+*below* an auto-accept RFQ's target is a dead end — quote at or above it
+to win and settle instantly. (`auto_accept: false`, the default, keeps
+the taker in control: quotes accumulate and you `accept_quote` manually.)
+
+### Partial fills
+
+`submit_rfq({allow_partial_fills: true, min_fill_size: M})` lets makers
+fill a *slice* of the RFQ (≥ `M`) instead of all-or-nothing. After a
+partial fill the RFQ stays open with a smaller `remaining_size` and keeps
+taking quotes until full or cancelled. A maker who over-quotes is
+capped-and-filled to what remains — never over-locked.
+
+**Compose them.** `auto_accept: true` + `allow_partial_fills: true` is a
+resting limit order: one large RFQ that auto-settles every qualifying
+slice at or above your floor, incrementally, until full — taker offline.
+See `cookbook/04-auto-accept-partial-taker.ts`.
+
+### Order lifecycle (cancel & withdraw)
+
+- **`cancel_rfq({rfq_id, reason?})`** (taker) — pull an open RFQ; the
+  earmark is released and all its pending quotes are refunded + rejected.
+- **`withdraw_quote({quote_id})`** (maker) — pull a pending quote; the
+  lock is released. There's no "edit quote": to reprice, withdraw then
+  `place_quote` again. Refresh stale quotes promptly so you aren't picked
+  off at a price the market has left.
+
+### Fees
+
+- **Trade fee:** taker pays **5 bps** of the quote notional, maker earns
+  a **1 bp** rebate, protocol keeps **4 bps**. Netted at settlement;
+  doesn't change the on-chain rate. Price your quotes accordingly.
+- **Withdrawal fee:** a flat **4000 SUPRA**, paid in SUPRA even for
+  non-SUPRA assets, when a master withdraws to L1. Master-side only (no
+  withdraw tool) — but budget for it to realize PnL.
 
 ---
 
@@ -189,7 +247,7 @@ SUPRA (buying it) — see the direction primer in the cookbook README so
 you never accidentally quote the sell side.** Every agent defaults to
 `DRY_RUN` and only trades with `LIVE=1`.
 
-- **`04-bullish-supra-accumulator.ts`** ⭐ — The flagship. Watches
+- **`05-bullish-supra-accumulator.ts`** ⭐ — The flagship. Watches
   `SUPRA/USDC`, `SUPRA/USDT`, `SUPRA/ETH` for sellers and **buys**
   SUPRA at up to the oracle price + a small premium, sized to balance.
 - **`00-generate-delegate-key.ts`** — Generate a delegate keypair
@@ -202,9 +260,12 @@ you never accidentally quote the sell side.** Every agent defaults to
 - **`03-counter-arb-taker.ts`** — The taker round-trip (submit RFQ →
   accept a quote with edge ≥ threshold → timeout-and-cancel). Point
   `BUY_TOKEN=SUPRA` to take the buy side.
+- **`04-auto-accept-partial-taker.ts`** — A resting limit order:
+  `auto_accept` + `allow_partial_fills` on one RFQ, auto-filling in
+  slices at or above your floor, offline, with cancel-on-deadline.
 
 Run the flagship with
-`MASTER_ADDRESS=0x... npx tsx cookbook/04-bullish-supra-accumulator.ts`
+`MASTER_ADDRESS=0x... npx tsx cookbook/05-bullish-supra-accumulator.ts`
 (after `npm install` in this directory) — it dry-runs by default.
 
 ---
@@ -237,8 +298,11 @@ encoders. The chain id hash (`get_chain_info → chainIdHashHex`)
 changes on a genesis swap — rare; one happened during the 2026-05-28
 mainnet launch.
 
-Current chain: `mainnet-beta-rc6-fast` (2026-06-02). ~1 batch/sec
-cadence; mempool fast-path enabled; 500ms idle heartbeat.
+There is no static release label to pin against — validators roll
+continuously. The authoritative version signal is the live chain id
+hash from `get_chain_info` (`chainIdHashHex`); treat that as the source
+of truth, not any version string. Mainnet Beta runs at roughly ~1
+batch/sec.
 
 ---
 
