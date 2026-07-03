@@ -65,6 +65,11 @@ const STALE_BUFFER_BPS = Number(process.env.STALE_BUFFER_BPS ?? 30);
 // Optional absolute max age for a resting bid (0 = never withdraw on age alone).
 const MAX_BID_AGE_MS = Number(process.env.MAX_BID_AGE_MS ?? 0);
 const SUMMARY_MS = Number(process.env.SUMMARY_MS ?? 60000); // session summary cadence
+// The read mirror behind /api/council/sequence-number can lag the live chain.
+// If it does, re-syncing to it would pin us to a stale (wrong) sequence and
+// every write would replay-reject. Skip the resync when the mirror is behind
+// the current batch by more than this many batches.
+const MIRROR_LAG_TOLERANCE = Number(process.env.MIRROR_LAG_TOLERANCE ?? 300);
 const MASTER = process.env.MASTER_ADDRESS!;
 const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
 
@@ -124,6 +129,27 @@ async function fetchSupraSellers(): Promise<any[]> {
   );
 }
 
+/** Is the read mirror (which serves the sequence endpoint) close enough to the
+ *  live chain to trust for a resync? Returns the lag in batches, or null if the
+ *  health read failed. */
+async function mirrorLag(): Promise<number | null> {
+  try {
+    const [cb, sq] = await Promise.all([
+      fetch(`${BASE_URL}/api/council/current-batch`).then((r) => r.json()),
+      fetch(
+        `${BASE_URL}/api/council/sequence-number?address=${signer!.addressHex}`,
+      ).then((r) => r.json()),
+    ]);
+    const cur = Number((cb as any).current_batch);
+    const mb = Number((sq as any).batch_height);
+    if (!Number.isFinite(cur) || !Number.isFinite(mb)) return null;
+    return cur - mb;
+  } catch {
+    return null;
+  }
+}
+let mirrorWarned = false;
+
 async function main() {
   console.log(
     DRY_RUN
@@ -177,10 +203,24 @@ async function pollOnce(dec: (s: string) => number, SUPRA_DEC: number): Promise<
   // drift (sub-second finality vs ~2s poll means last cycle's commits are
   // already reflected on chain).
   if (signer) {
-    try {
-      await signer.loadSequenceFromChain();
-    } catch {
-      /* transient read failure — keep last known sequence, retry next cycle */
+    const lag = await mirrorLag();
+    if (lag !== null && lag > MIRROR_LAG_TOLERANCE) {
+      // Mirror is stale — resyncing would pin us to a wrong sequence. Keep the
+      // local optimistic counter and wait for the mirror to catch up. Writes
+      // may reject meanwhile; that's a backend-lag symptom, not a bot bug.
+      if (!mirrorWarned) {
+        console.warn(
+          `[accumulator] read mirror lagging chain by ${lag} batches — skipping sequence resync until it recovers (trades may reject).`,
+        );
+        mirrorWarned = true;
+      }
+    } else {
+      mirrorWarned = false;
+      try {
+        await signer.loadSequenceFromChain();
+      } catch {
+        /* transient read failure — keep last known sequence, retry next cycle */
+      }
     }
   }
 
