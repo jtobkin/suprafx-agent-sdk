@@ -19,7 +19,7 @@ package implements those concepts.
 |---|---|---|
 | `@suprafx/agent-sdk` (the JS/TS lib) | Typed client + signer for the SupraFX REST endpoints | You're writing a custom agent in Node/TypeScript |
 | `suprafx-mcp` (the CLI binary) | An MCP server that exposes SupraFX as tools | You're using Claude Desktop, Cursor, Continue, or any MCP-aware AI agent |
-| `cookbook/` | 3 runnable example agents | You want a starting point you can fork |
+| `cookbook/` | Runnable example agents (incl. a bullish SUPRA accumulator) | You want a starting point you can fork |
 
 ---
 
@@ -183,18 +183,29 @@ inactive. Every subsequent envelope from the delegate is rejected.
 
 ## Cookbook
 
-[`cookbook/`](./cookbook/) ships three runnable examples:
+[`cookbook/`](./cookbook/) ships runnable examples. **Most agents here
+are bullish SUPRA, so the examples are framed around _accumulating_
+SUPRA (buying it) — see the direction primer in the cookbook README so
+you never accidentally quote the sell side.** Every agent defaults to
+`DRY_RUN` and only trades with `LIVE=1`.
 
-- **`01-passive-quoter.ts`** — Quote at reference price + fixed spread
-  on every RFQ for a pair. Simplest possible market maker.
-- **`02-inventory-aware-quoter.ts`** — Tracks the master's available
-  balance, refuses overexposure, widens spread as inventory tilts.
-- **`03-counter-arb-taker.ts`** — Submits an RFQ then accepts any
-  maker quote with edge ≥ a threshold. Demonstrates the full
-  taker round-trip including timeout-and-cancel.
+- **`04-bullish-supra-accumulator.ts`** ⭐ — The flagship. Watches
+  `SUPRA/USDC`, `SUPRA/USDT`, `SUPRA/ETH` for sellers and **buys**
+  SUPRA at up to the oracle price + a small premium, sized to balance.
+- **`00-generate-delegate-key.ts`** — Generate a delegate keypair
+  locally (private key never touches the browser); paste only the
+  public key into the delegate form.
+- **`01-passive-quoter.ts`** — Simplest maker: quote reference ± a
+  fixed spread on every RFQ for a pair.
+- **`02-inventory-aware-quoter.ts`** — Tracks balances, refuses
+  overexposure, widens spread as inventory tilts.
+- **`03-counter-arb-taker.ts`** — The taker round-trip (submit RFQ →
+  accept a quote with edge ≥ threshold → timeout-and-cancel). Point
+  `BUY_TOKEN=SUPRA` to take the buy side.
 
-Run with `npx tsx cookbook/01-passive-quoter.ts` (after `npm install`
-in this directory).
+Run the flagship with
+`MASTER_ADDRESS=0x... npx tsx cookbook/04-bullish-supra-accumulator.ts`
+(after `npm install` in this directory) — it dry-runs by default.
 
 ---
 

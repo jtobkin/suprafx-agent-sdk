@@ -116,7 +116,26 @@ risks and fixes. Don't run it live.
 
 ---
 
-## 8. Explain a rejection — "why did it fail?"
+## 8. Accumulate SUPRA (bullish flagship) ⭐
+
+```
+I'm bullish SUPRA and want to accumulate it. Using cookbook/04
+(bullish-supra-accumulator), run it in DRY_RUN against the live book
+with my master address so I can watch it evaluate real SUPRA sellers.
+It should only bid to BUY SUPRA at up to the oracle price plus a small
+premium (MAX_PREMIUM_BPS), paying USDC/USDT/ETH, sized to my balance.
+Explain each "WOULD buy" line. Don't set LIVE=1 — I'll go live myself
+once I've funded the quote assets and enabled their delegate caps.
+```
+
+Tune it:
+
+```
+Adjust the accumulator so it only buys SUPRA at or below the oracle
+price (no premium), and only spends USDC. Then dry-run it again.
+```
+
+## 9. Explain a rejection — "why did it fail?"
 
 ```
 My write got `ok: false`. Here's the response: <paste JSON>. Explain the code
