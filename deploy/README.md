@@ -1,6 +1,6 @@
 # Deploy — run an agent persistently
 
-Keeps the bullish SUPRA accumulator (`cookbook/04`) running in the
+Keeps the bullish SUPRA accumulator (`cookbook/05`) running in the
 background with auto-restart on crash, via [pm2](https://pm2.keymetrics.io/).
 
 **Safety:** the launcher defaults to **DRY_RUN**. It only trades for

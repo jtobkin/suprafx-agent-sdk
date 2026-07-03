@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Persistent launcher for the bullish SUPRA accumulator (cookbook/04).
+# Persistent launcher for the bullish SUPRA accumulator (cookbook/05).
 #
 # - Loads the delegate private key from ~/.suprafx/delegate.json (never printed).
 # - Sources optional overrides from ~/.suprafx/accumulator.env
@@ -32,4 +32,4 @@ export MAX_PREMIUM_BPS="${MAX_PREMIUM_BPS:-25}"
 # NOTE: LIVE is intentionally NOT defaulted on. Unset => DRY_RUN.
 
 echo "[deploy] starting accumulator (LIVE=${LIVE:-<unset → DRY_RUN>}) pairs from QUOTE_ASSETS=$QUOTE_ASSETS premium=${MAX_PREMIUM_BPS}bps"
-exec npx tsx cookbook/04-bullish-supra-accumulator.ts
+exec npx tsx cookbook/05-bullish-supra-accumulator.ts

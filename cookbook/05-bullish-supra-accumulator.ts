@@ -36,7 +36,7 @@
  *
  * Run (DRY_RUN by default — observes + logs, signs nothing):
  *   MASTER_ADDRESS=0x... QUOTE_ASSETS=USDC,USDT,ETH MAX_PREMIUM_BPS=25 \
- *   npx tsx cookbook/04-bullish-supra-accumulator.ts
+ *   npx tsx cookbook/05-bullish-supra-accumulator.ts
  *
  * Go live (real quotes, real funds) by adding SUPRAFX_DELEGATE_PRIV_HEX + LIVE=1.
  */
