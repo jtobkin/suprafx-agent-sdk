@@ -22,13 +22,20 @@
  * Discovery: the orderbook "feed" is poll-oriented — it emits a single
  * `connected` event with `{pollInterval:1000}` and does not hold a
  * durable stream, so this agent POLLS the REST orderbook every
- * `POLL_MS` (default 2000) instead. Reliable, no missed RFQs, no
- * reconnect noise.
+ * `POLL_MS` (default 2000). Reliable, no missed RFQs, no reconnect noise.
+ *
+ * Safeguards:
+ *   - MAX_SPEND_<ASSET> (e.g. MAX_SPEND_USDC=50) — a soft session cap on
+ *     actual settled spend per quote asset, measured from real balance
+ *     deltas (resets on restart; the delegate earmark cap is the hard
+ *     on-chain backstop).
+ *   - QUOTE_TTL_MS (default 30000) — withdraw unmatched bids older than
+ *     this so a bid never lingers at a stale oracle price; the RFQ is
+ *     then eligible to be re-bid at the fresh price.
+ *   - Prints a periodic session summary (SUPRA accumulated + spend).
  *
  * Run (DRY_RUN by default — observes + logs, signs nothing):
- *   MASTER_ADDRESS=0x... \
- *   QUOTE_ASSETS=USDC,USDT,ETH \
- *   MAX_PREMIUM_BPS=25 \
+ *   MASTER_ADDRESS=0x... QUOTE_ASSETS=USDC,USDT,ETH MAX_PREMIUM_BPS=25 \
  *   npx tsx cookbook/04-bullish-supra-accumulator.ts
  *
  * Go live (real quotes, real funds) by adding SUPRAFX_DELEGATE_PRIV_HEX + LIVE=1.
@@ -49,8 +56,17 @@ const QUOTE_ASSETS = (process.env.QUOTE_ASSETS ?? "USDC,USDT,ETH")
 const MAX_PREMIUM_BPS = Number(process.env.MAX_PREMIUM_BPS ?? 25); // pay up to +0.25% over oracle
 const MIN_SUPRA_FILL = Number(process.env.MIN_SUPRA_FILL ?? 1); // ignore dust fills
 const POLL_MS = Number(process.env.POLL_MS ?? 2000); // orderbook poll cadence
+const QUOTE_TTL_MS = Number(process.env.QUOTE_TTL_MS ?? 30000); // withdraw bids older than this
+const SUMMARY_MS = Number(process.env.SUMMARY_MS ?? 60000); // session summary cadence
 const MASTER = process.env.MASTER_ADDRESS!;
 const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
+
+// Per-quote-asset soft spend cap (session), e.g. MAX_SPEND_USDC=50.
+const SPEND_CAP: Record<string, number> = {};
+for (const q of QUOTE_ASSETS) {
+  const v = process.env[`MAX_SPEND_${q}`];
+  SPEND_CAP[q] = v ? Number(v) : Infinity;
+}
 
 // Safety: buying SUPRA locks quote-asset funds. DRY_RUN unless LIVE=1.
 const DRY_RUN = process.env.LIVE !== "1";
@@ -68,6 +84,11 @@ const client = new SupraFxClient({ baseUrl: BASE_URL });
 const signer = PRIV ? new DelegateSigner({ delegatePrivKeyHex: PRIV, client }) : null;
 
 const PAIRS = QUOTE_ASSETS.map((q) => `SUPRA/${q}`);
+
+const seen = new Set<string>(); // RFQ ids already bid (bid once each unless refreshed)
+const placed = new Map<string, { quote_id: Uint8Array; ts: number }>(); // live open bids
+let startTotals: Record<string, number> | null = null; // baseline for spend/PnL
+let lastSummary = 0;
 
 /** Live oracle price for SUPRA in the given quote asset (Q per SUPRA). */
 async function oracleQperSupra(pair: string): Promise<number | null> {
@@ -94,8 +115,6 @@ async function fetchSupraSellers(): Promise<any[]> {
   );
 }
 
-const seen = new Set<string>(); // RFQ ids we've already quoted (bid once each)
-
 async function main() {
   console.log(
     DRY_RUN
@@ -110,8 +129,12 @@ async function main() {
     (sym === "SUPRA" ? 8 : sym === "ETH" ? 18 : 6);
   const SUPRA_DEC = dec("SUPRA");
 
+  const caps = QUOTE_ASSETS.map((q) =>
+    `${q}${SPEND_CAP[q] === Infinity ? "" : "≤" + SPEND_CAP[q]}`,
+  ).join(",");
   console.log(
-    `[accumulator] delegate=${signer?.addressHex ?? "(none — dry run)"} pairs=${PAIRS.join(", ")} max_premium=${MAX_PREMIUM_BPS}bps poll=${POLL_MS}ms`,
+    `[accumulator] delegate=${signer?.addressHex ?? "(none — dry run)"} pairs=${PAIRS.join(", ")} ` +
+      `max_premium=${MAX_PREMIUM_BPS}bps poll=${POLL_MS}ms ttl=${QUOTE_TTL_MS}ms spend_caps=${caps}`,
   );
 
   // Poll loop: sequential, never overlapping, resilient to transient errors.
@@ -126,26 +149,74 @@ async function main() {
 }
 
 async function pollOnce(dec: (s: string) => number, SUPRA_DEC: number): Promise<void> {
-  const fresh = (await fetchSupraSellers()).filter((rfq) => !seen.has(rfq.id));
-  if (fresh.length === 0) return;
-
-  // One balance snapshot per cycle; reserve spend as we bid so we never
-  // overcommit across multiple sellers seen in the same cycle.
+  // Fresh balance snapshot every cycle (drives budget, spend caps, PnL).
   const bal = await client.getBalances(MASTER);
   const avail: Record<string, number> = {};
-  for (const b of bal) avail[b.asset.toUpperCase()] = b.available;
+  const total: Record<string, number> = {};
+  for (const b of bal) {
+    avail[b.asset.toUpperCase()] = b.available;
+    total[b.asset.toUpperCase()] = b.total;
+  }
+  if (!startTotals) startTotals = { ...total };
 
+  await withdrawStaleBids();
+  maybeSummary(total);
+
+  // Effective budget per quote asset = min(available, remaining spend cap).
+  const budget: Record<string, number> = {};
+  for (const q of QUOTE_ASSETS) {
+    const spent = Math.max(0, (startTotals[q] ?? 0) - (total[q] ?? 0));
+    const capLeft = SPEND_CAP[q] - spent; // Infinity if uncapped
+    budget[q] = Math.max(0, Math.min(avail[q] ?? 0, capLeft));
+  }
+
+  const fresh = (await fetchSupraSellers()).filter((rfq) => !seen.has(rfq.id));
   for (const rfq of fresh) {
-    seen.add(rfq.id); // bid at most once per RFQ
-    await evaluate(rfq, avail, dec, SUPRA_DEC);
+    seen.add(rfq.id);
+    await evaluate(rfq, budget, dec, SUPRA_DEC);
   }
 }
 
+/** Withdraw any live bid older than QUOTE_TTL_MS so it never lingers at a
+ *  stale oracle price. The RFQ becomes eligible to be re-bid fresh. */
+async function withdrawStaleBids(): Promise<void> {
+  if (DRY_RUN || placed.size === 0) return;
+  const now = Date.now();
+  for (const [rfqId, q] of placed) {
+    if (now - q.ts < QUOTE_TTL_MS) continue;
+    try {
+      const r = await signer!.withdrawQuote({ quote_id: q.quote_id });
+      if (r.ok) {
+        console.log(
+          `[accumulator] ↩ withdrew stale bid on ${rfqId.slice(0, 8)} (age ${Math.round((now - q.ts) / 1000)}s)`,
+        );
+      }
+    } catch {
+      /* quote may already be filled/gone; ignore */
+    }
+    placed.delete(rfqId);
+    seen.delete(rfqId); // allow a fresh bid if the RFQ is still open
+  }
+}
+
+function maybeSummary(total: Record<string, number>): void {
+  const now = Date.now();
+  if (now - lastSummary < SUMMARY_MS || !startTotals) return;
+  lastSummary = now;
+  const supraGain = (total["SUPRA"] ?? 0) - (startTotals["SUPRA"] ?? 0);
+  const spends = QUOTE_ASSETS.map(
+    (q) => `${Math.max(0, (startTotals![q] ?? 0) - (total[q] ?? 0)).toPrecision(4)} ${q}`,
+  ).join(", ");
+  console.log(
+    `[accumulator] 📊 session: +${supraGain.toFixed(2)} SUPRA accumulated; spent ${spends}; open bids ${placed.size}`,
+  );
+}
+
 /** Evaluate one SUPRA-seller RFQ and (in LIVE) place a buy quote.
- *  Mutates `avail` to reserve spent budget for the rest of this cycle. */
+ *  Mutates `budget` to reserve spent funds for the rest of this cycle. */
 async function evaluate(
   rfq: any,
-  avail: Record<string, number>,
+  budget: Record<string, number>,
   dec: (s: string) => number,
   SUPRA_DEC: number,
 ): Promise<void> {
@@ -160,14 +231,14 @@ async function evaluate(
     }
     const ceiling = oracle * (1 + MAX_PREMIUM_BPS / 10000); // never pay above this
 
-    const budgetQ = avail[quote] ?? 0; // already-reserved amounts subtracted
+    const budgetQ = budget[quote] ?? 0; // available ∩ remaining spend cap, minus this-cycle reservations
     const rfqSize = Number(rfq.remaining_size ?? rfq.size); // SUPRA offered
     const fillSupra = Math.min(rfqSize, budgetQ / ceiling);
 
     if (!(fillSupra >= MIN_SUPRA_FILL)) {
       console.log(
         `[accumulator] ${rfq.pair} ${String(rfq.id).slice(0, 8)}: only ${fillSupra.toFixed(2)} SUPRA affordable ` +
-          `(budget ${budgetQ} ${quote}); < MIN_SUPRA_FILL=${MIN_SUPRA_FILL}; skipping`,
+          `(budget ${budgetQ.toPrecision(4)} ${quote}); < MIN_SUPRA_FILL=${MIN_SUPRA_FILL}; skipping`,
       );
       return;
     }
@@ -179,19 +250,21 @@ async function evaluate(
       `@ ${ceiling.toPrecision(6)} ${quote}/SUPRA (oracle ${oracle.toPrecision(6)}, +${MAX_PREMIUM_BPS}bps)`;
 
     if (DRY_RUN) {
-      avail[quote] = budgetQ - qSpend; // reserve so we don't "would buy" past budget
+      budget[quote] = budgetQ - qSpend; // reserve so we don't "would buy" past budget
       console.log(`[accumulator] DRY RUN: WOULD buy ${line} — not signing.`);
       return;
     }
 
+    const quoteId = randomBytes16();
     const r = await signer!.placeQuote({
       rfq_id: uuidToBytes16(rfq.id),
-      quote_id: randomBytes16(),
+      quote_id: quoteId,
       rate: toRateBFT(ceiling, SUPRA_DEC, qDec),
       fill_size: toMicroUnits(fillSupra, SUPRA_DEC),
     });
     if (r.ok) {
-      avail[quote] = budgetQ - qSpend; // reserve committed spend for this cycle
+      budget[quote] = budgetQ - qSpend; // reserve committed spend for this cycle
+      placed.set(rfq.id, { quote_id: quoteId, ts: Date.now() });
       console.log(`[accumulator] ✓ bid to buy ${line} (batch ${r.batch})`);
     } else {
       console.warn(`[accumulator] rejected (${rfq.pair}): ${r.code}: ${r.detail}`);
