@@ -7,6 +7,12 @@ background with auto-restart on crash, via [pm2](https://pm2.keymetrics.io/).
 real when *you* set `LIVE=1` in `~/.suprafx/accumulator.env`. Starting
 pm2 is not the same as going live — flipping `LIVE=1` is.
 
+> **Use `npx pm2` — do NOT `npm install -g pm2`.** A global install
+> writes to `/usr/local/lib` and fails with `EACCES` on most macOS
+> setups. `npx pm2` needs no sudo and no global install; it caches pm2
+> on first use. (The pm2 daemon it starts persists across your terminal
+> sessions.)
+
 ## 1. One-time config (gitignored, on your machine)
 
 Create `~/.suprafx/accumulator.env`:
@@ -21,12 +27,12 @@ MAX_PREMIUM_BPS=25
 The delegate key is read automatically from `~/.suprafx/delegate.json`
 (mode 0600) — never put it in this file.
 
-## 2. Start it
+## 2. Start it (DRY_RUN)
 
 ```bash
-npm install -g pm2
-pm2 start deploy/ecosystem.config.js
-pm2 logs supra-accumulator          # watch "WOULD buy …" (dry) or "✓ bid to buy …" (live)
+npx pm2 start deploy/ecosystem.config.cjs
+npx pm2 logs supra-accumulator        # watch "WOULD buy …" (dry) or "✓ bid to buy …" (live)
+npx pm2 save                          # remember this process list
 ```
 
 ## 3. Go live
@@ -35,31 +41,31 @@ When you've funded the quote assets and enabled their delegate caps:
 
 ```bash
 #  edit ~/.suprafx/accumulator.env → uncomment LIVE=1, then:
-pm2 restart supra-accumulator
-pm2 logs supra-accumulator
+npx pm2 restart supra-accumulator
+npx pm2 logs supra-accumulator        # now: "✓ bid to buy … SUPRA"
 ```
 
 ## 4. Survive reboot (optional)
 
 ```bash
-pm2 save
-pm2 startup        # run the sudo command it prints
+npx pm2 save
+npx pm2 startup        # run the sudo command it prints (one-time)
 ```
 
 ## macOS caveats (why a laptop isn't ideal for 24/7)
 
 - pm2 keeps the agent alive while the Mac is **awake**, but it **pauses
   on sleep**. To keep quoting overnight, prevent sleep:
-  `caffeinate -is pm2 logs supra-accumulator` (or System Settings →
+  `caffeinate -is npx pm2 logs supra-accumulator` (or System Settings →
   Battery → prevent sleep on power adapter).
-- On reboot it only comes back if you ran `pm2 save && pm2 startup`.
-- For genuinely continuous operation, run the same setup on a small
-  VPS / Railway / Fly instead — identical files, just an always-on host.
+- On reboot it only comes back if you ran `npx pm2 save` + `npx pm2 startup`.
+- For genuinely continuous operation, run the same files on a small
+  VPS / Railway / Fly instead — identical setup, just an always-on host.
 
 ## Stop / status
 
 ```bash
-pm2 stop supra-accumulator
-pm2 status
-pm2 delete supra-accumulator
+npx pm2 status
+npx pm2 stop supra-accumulator
+npx pm2 delete supra-accumulator
 ```
