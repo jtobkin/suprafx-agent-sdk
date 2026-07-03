@@ -21,11 +21,19 @@ Create `~/.suprafx/accumulator.env`:
 MASTER_ADDRESS=0xYOUR_MASTER_STARKEY_ADDRESS
 QUOTE_ASSETS=USDC,USDT,ETH
 MAX_PREMIUM_BPS=25
-# LIVE=1        # <-- uncomment ONLY when you're funded + caps enabled and ready to trade
+# Optional safeguards:
+# MAX_SPEND_USDC=50     # soft session spend cap per asset (delegate cap = hard limit)
+# MAX_SPEND_USDT=50
+# QUOTE_TTL_MS=30000    # withdraw unmatched bids older than this
+# POLL_MS=2000          # orderbook poll cadence
+# LIVE=1                # <-- uncomment ONLY when you're funded + caps enabled and ready to trade
 ```
 
 The delegate key is read automatically from `~/.suprafx/delegate.json`
 (mode 0600) — never put it in this file.
+
+For day-to-day operation (watch, adjust, kill switch, troubleshooting),
+see **[RUNBOOK.md](./RUNBOOK.md)**.
 
 ## 2. Start it (DRY_RUN)
 

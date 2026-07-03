@@ -66,6 +66,51 @@ up; the "quote" is what the taker receives.
 
 ---
 
+## Gotchas (hard-won — read before you build)
+
+Non-obvious things that cost real debugging time:
+
+1. **The orderbook "feed" is poll-oriented, not a durable stream.**
+   `GET /api/orderbook/feed?pairs=…` emits a single `connected` event
+   carrying `{"pollInterval":1000}` and does **not** hold an open SSE
+   stream — a long-lived `EventSource` will "error and reconnect" every
+   ~60s and miss RFQs in the gaps. **Poll the REST orderbook instead:**
+   `GET /api/suprafx/rfqs?scope=platform&status=open&limit=100` every
+   ~1–2s, diffing against RFQ ids you've already handled.
+
+2. **Prices come from `/api/oracle`, not from the RFQ.** Use
+   `GET /api/oracle?pair=SUPRA/USDC` → `conversionRate` = **quote per
+   base** (e.g. USDC per SUPRA). The RFQ's own `reference_price` can be
+   `0` on some directions, so don't rely on it for pricing. This is the
+   same oracle the dApp shows (it wraps Supra's native feed).
+
+3. **Direction is encoded by pair order — to BUY an asset, quote the
+   pair where it's the _base_.** `BASE/QUOTE` = taker sells BASE,
+   receives QUOTE; the maker pays QUOTE and receives BASE. So to
+   accumulate SUPRA you quote `SUPRA/<quote>` RFQs (someone selling
+   SUPRA), paying the quote asset. Quoting `<quote>/SUPRA` does the
+   opposite — it sells your SUPRA.
+
+4. **Delegate caps are deny-by-default, per asset.** An asset with no
+   cap (or a cap of `0`) cannot be traded at all (fail-closed). The
+   **maker locks the QUOTE asset; the taker locks the BASE asset** — so
+   enable + fund a cap for every asset you actually *pay*, not just the
+   one you want to receive.
+
+5. **The delegate private key is single-copy.** If you use the site's
+   "Generate", the key JSON downloads **only after** the master
+   signature commits on chain, and there is no re-download. The more
+   robust path: generate the ed25519 keypair locally (see
+   `cookbook/00-generate-delegate-key.ts`), paste only the **public**
+   key into the delegate form — the secret never touches the browser.
+
+6. **`body.ok` is the truth signal, not the HTTP status.** A write can
+   return HTTP 200 with `{ ok: false, code, detail }`. Always branch on
+   `body.ok`; read `detail` for the human-readable reason. See the error
+   catalog in §7.
+
+---
+
 ## 2. The dApp endpoints
 
 All hosted at `https://suprafx.ai`. No authentication for reads; writes
