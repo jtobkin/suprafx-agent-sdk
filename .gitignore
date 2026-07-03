@@ -11,3 +11,5 @@ config.json
 *.key
 *delegate*.json
 *-private-key*.json
+deploy/*.env
+deploy/.env*
