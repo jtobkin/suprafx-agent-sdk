@@ -65,6 +65,10 @@ const STALE_BUFFER_BPS = Number(process.env.STALE_BUFFER_BPS ?? 30);
 // Optional absolute max age for a resting bid (0 = never withdraw on age alone).
 const MAX_BID_AGE_MS = Number(process.env.MAX_BID_AGE_MS ?? 0);
 const SUMMARY_MS = Number(process.env.SUMMARY_MS ?? 60000); // session summary cadence
+// Bound every network call so a dropped connection (e.g. a laptop losing wifi)
+// can't hang the poll loop indefinitely — it errors, the loop continues, and
+// it self-recovers when connectivity returns.
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 10000);
 const MASTER = process.env.MASTER_ADDRESS!;
 const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
 
@@ -99,10 +103,21 @@ const placed = new Map<string, { quote_id: Uint8Array; ts: number; pair: string;
 let startTotals: Record<string, number> | null = null; // baseline for spend/PnL
 let lastSummary = 0;
 
+/** fetch() with a hard timeout so a stalled connection never hangs the loop. */
+async function fetchWithTimeout(url: string): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /** Live oracle price for SUPRA in the given quote asset (Q per SUPRA). */
 async function oracleQperSupra(pair: string): Promise<number | null> {
   try {
-    const r = await fetch(`${BASE_URL}/api/oracle?pair=${encodeURIComponent(pair)}`);
+    const r = await fetchWithTimeout(`${BASE_URL}/api/oracle?pair=${encodeURIComponent(pair)}`);
     if (!r.ok) return null;
     const j = (await r.json()) as { conversionRate?: number };
     const rate = Number(j.conversionRate);
@@ -114,7 +129,7 @@ async function oracleQperSupra(pair: string): Promise<number | null> {
 
 /** Open RFQs where a taker is selling SUPRA (SUPRA is the base). */
 async function fetchSupraSellers(): Promise<any[]> {
-  const r = await fetch(
+  const r = await fetchWithTimeout(
     `${BASE_URL}/api/suprafx/rfqs?scope=platform&status=open&limit=100`,
   );
   if (!r.ok) return [];
