@@ -223,8 +223,12 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
 
   // 3. For each side, seed depth if it's thin and we aren't already there.
   for (const side of SIDES) {
-    const nonOurs = open.filter((r) => r.pair === side.pair && !mine.has(String(r.id))).length;
-    const oursHere = [...mine.values()].some((m) => m.side.pair === side.pair);
+    // Judge depth from the actual book by taker address, not our in-memory
+    // set — so restarts don't miscount our own resting RFQs as "others".
+    const isOurs = (r: any) => String(r.taker_address ?? "").toLowerCase() === MASTER.toLowerCase();
+    const onSide = open.filter((r) => r.pair === side.pair);
+    const nonOurs = onSide.filter((r) => !isOurs(r)).length;
+    const oursHere = onSide.some(isOurs); // already have one of ours resting here
     if (nonOurs >= MIN_DEPTH || oursHere) continue;
 
     const rate = rateOf(side.sell, side.buy, usd); // buy per sell (from native USD feeds)
