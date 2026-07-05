@@ -290,6 +290,8 @@ async function evaluate(
   try {
     const { base, quote } = parsePair(rfq.pair);
     if (base !== "SUPRA") return; // must be a SUPRA seller
+    // Never quote our OWN RFQ (same master = self-trade the chain rejects).
+    if (String(rfq.taker_address ?? "").toLowerCase() === MASTER.toLowerCase()) return;
 
     const oracle = await oracleQperSupra(rfq.pair); // Q per SUPRA
     if (!oracle) {
