@@ -19,5 +19,17 @@ module.exports = {
       restart_delay: 5000,
       time: true,
     },
+    {
+      // Multi-market RFQ liquidity seeder (cookbook/06). Config in
+      // ~/.suprafx/seeder.env. Start just this one with:
+      //   npx pm2 start deploy/ecosystem.config.cjs --only supra-seeder
+      name: "supra-seeder",
+      script: "deploy/run-seeder.sh",
+      interpreter: "bash",
+      autorestart: true,
+      max_restarts: 20,
+      restart_delay: 5000,
+      time: true,
+    },
   ],
 };
