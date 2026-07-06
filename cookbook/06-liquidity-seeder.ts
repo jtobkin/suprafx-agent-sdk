@@ -43,7 +43,9 @@ const SUPRA_EDGE_BPS = Number(process.env.SUPRA_EDGE_BPS ?? 25); // SUPRA offers
 const MIN_DEPTH = Number(process.env.MIN_DEPTH ?? 2); // post when fewer than this many non-ours on a side
 const MOVE_CANCEL_BPS = Number(process.env.MOVE_CANCEL_BPS ?? 100); // cancel once oracle moves this far from post (100 = 1%)
 const POLL_MS = Number(process.env.POLL_MS ?? 60000); // 1 minute
-const RFQ_EXPIRE_MIN = Number(process.env.RFQ_EXPIRE_MIN ?? 30); // on-chain backstop expiry
+const RFQ_EXPIRE_MIN = Number(process.env.RFQ_EXPIRE_MIN ?? 60); // on-chain backstop expiry (> AGE_CANCEL so we cancel while live)
+const MAX_ACTIVE_RFQS = Number(process.env.MAX_ACTIVE_RFQS ?? 10); // hard cap on our simultaneous open RFQs
+const AGE_CANCEL_MS = Number(process.env.AGE_CANCEL_MIN ?? 30) * 60 * 1000; // cancel our RFQs older than this
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 10000);
 
 // Which chain each token settles on.
@@ -179,7 +181,7 @@ async function main() {
   console.log(
     `[seeder] delegate=${signer?.addressHex ?? "(none — dry run)"} sides=${SIDES.length} ` +
       `size≈$${RFQ_USD_SIZE} supra_edge=${SUPRA_EDGE_BPS}bps min_depth=${MIN_DEPTH} ` +
-      `cancel_move=${MOVE_CANCEL_BPS}bps poll=${POLL_MS / 1000}s`,
+      `cancel_move=${MOVE_CANCEL_BPS}bps max_active=${MAX_ACTIVE_RFQS} age_cancel=${AGE_CANCEL_MS / 60000}min poll=${POLL_MS / 1000}s`,
   );
 
   for (;;) {
@@ -213,6 +215,30 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     }
   }
 
+  const nowMsCycle = Date.now();
+  const isOursRfq = (r: any) => String(r.taker_address ?? "").toLowerCase() === MASTER.toLowerCase();
+  const cancelled = new Set<string>(); // ids we cancel this cycle (so counts/depth exclude them)
+
+  // 1a. Age-cancel: cancel any of OUR RFQs older than AGE_CANCEL_MS. Book-based
+  //     (uses created_at) so it also cleans up orders left by a prior run.
+  for (const r of open.filter(isOursRfq)) {
+    const created = r.created_at ? Date.parse(r.created_at) : NaN;
+    if (!Number.isFinite(created) || nowMsCycle - created < AGE_CANCEL_MS) continue;
+    const ageMin = Math.round((nowMsCycle - created) / 60000);
+    if (DRY_RUN) {
+      console.log(`[seeder] DRY RUN: WOULD cancel ${r.pair} ${String(r.id).slice(0, 8)} — age ${ageMin}min`);
+    } else {
+      const c = await signer!.cancelRfq({ rfq_id: uuidToBytes16(String(r.id)), reason: "age" });
+      console.log(
+        c.ok
+          ? `[seeder] ✗ cancelled ${r.pair} ${String(r.id).slice(0, 8)} — age ${ageMin}min`
+          : `[seeder] cancel failed ${String(r.id).slice(0, 8)}: ${c.code}: ${c.detail}`,
+      );
+    }
+    cancelled.add(String(r.id));
+    mine.delete(String(r.id));
+  }
+
   // 1. Manage our existing RFQs: drop ones that closed; cancel ones the
   //    market has moved away from by >= MOVE_CANCEL_BPS.
   for (const [idHex, info] of [...mine]) {
@@ -233,6 +259,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
             : `[seeder] cancel failed ${idHex.slice(0, 8)}: ${c.code}: ${c.detail}`,
         );
       }
+      cancelled.add(idHex);
       mine.delete(idHex);
     }
   }
@@ -242,14 +269,15 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
   const avail: Record<string, number> = {};
   for (const b of bal) avail[b.asset.toUpperCase()] = b.available;
 
-  // 3. For each side, seed depth if it's thin and we aren't already there.
+  // 3. Post to seed thin sides — capped at MAX_ACTIVE_RFQS total.
+  let activeCount = open.filter((r) => isOursRfq(r) && !cancelled.has(String(r.id))).length;
   for (const side of SIDES) {
+    if (activeCount >= MAX_ACTIVE_RFQS) break; // hard global cap on our open RFQs
     // Judge depth from the actual book by taker address, not our in-memory
     // set — so restarts don't miscount our own resting RFQs as "others".
-    const isOurs = (r: any) => String(r.taker_address ?? "").toLowerCase() === MASTER.toLowerCase();
-    const onSide = open.filter((r) => r.pair === side.pair);
-    const nonOurs = onSide.filter((r) => !isOurs(r)).length;
-    const oursHere = onSide.some(isOurs); // already have one of ours resting here
+    const onSide = open.filter((r) => r.pair === side.pair && !cancelled.has(String(r.id)));
+    const nonOurs = onSide.filter((r) => !isOursRfq(r)).length;
+    const oursHere = onSide.some(isOursRfq); // already have one of ours resting here
     if (nonOurs >= MIN_DEPTH || oursHere) continue;
 
     const rate = rateOf(side.sell, side.buy, usd); // buy per sell (from native USD feeds)
@@ -273,6 +301,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
 
     if (DRY_RUN) {
       console.log(`[seeder] DRY RUN: WOULD post ${line} — not signing.`);
+      activeCount++;
       // Reserve locally so we don't "would post" the same side twice per run.
       mine.set(`dry-${side.pair}-${[...mine.keys()].length}`, {
         rfqId: new Uint8Array(16),
@@ -300,6 +329,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     });
     if (r.ok) {
       mine.set(rfqIdHex, { rfqId, side, oracleAtPost: rate });
+      activeCount++;
       console.log(`[seeder] ✓ posted ${line} [${rfqIdHex.slice(0, 8)}]`);
     } else {
       console.warn(`[seeder] post failed ${side.pair}: ${r.code}: ${r.detail}`);
@@ -324,6 +354,13 @@ function normalizeChain(chain: string): string {
 function bytesToUuid(b: Uint8Array): string {
   const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function uuidToBytes16(uuid: string): Uint8Array {
+  const hex = uuid.replace(/-/g, "");
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
 }
 
 function randomBytes16(): Uint8Array {
