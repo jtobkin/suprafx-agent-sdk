@@ -32,6 +32,7 @@ import {
   toMicroUnits,
   toRateBFT,
 } from "../src/index.js";
+import { parsePair } from "../src/asset-registry.js";
 
 const BASE_URL = process.env.SUPRAFX_BASE_URL ?? "https://suprafx.ai";
 const MASTER = process.env.MASTER_ADDRESS!;
@@ -44,7 +45,7 @@ const MIN_DEPTH = Number(process.env.MIN_DEPTH ?? 2); // post when fewer than th
 const MOVE_CANCEL_BPS = Number(process.env.MOVE_CANCEL_BPS ?? 100); // cancel once oracle moves this far from post (100 = 1%)
 const POLL_MS = Number(process.env.POLL_MS ?? 60000); // 1 minute
 const RFQ_EXPIRE_MIN = Number(process.env.RFQ_EXPIRE_MIN ?? 60); // on-chain backstop expiry (> AGE_CANCEL so we cancel while live)
-const MAX_ACTIVE_RFQS = Number(process.env.MAX_ACTIVE_RFQS ?? 10); // hard cap on our simultaneous open RFQs
+const MAX_ACTIVE_RFQS = Number(process.env.MAX_ACTIVE_RFQS ?? 15); // hard cap on our simultaneous open RFQs
 const AGE_CANCEL_MS = Number(process.env.AGE_CANCEL_MIN ?? 30) * 60 * 1000; // cancel our RFQs older than this
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 10000);
 
@@ -239,29 +240,47 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     mine.delete(String(r.id));
   }
 
-  // 1. Manage our existing RFQs: drop ones that closed; cancel ones the
-  //    market has moved away from by >= MOVE_CANCEL_BPS.
-  for (const [idHex, info] of [...mine]) {
-    if (!openIds.has(idHex)) {
-      mine.delete(idHex); // filled, cancelled, or expired
+  // Drop in-memory tracking of RFQs that have closed on chain.
+  for (const idHex of [...mine.keys()]) {
+    if (!openIds.has(idHex)) mine.delete(idHex);
+  }
+
+  // 1b. Price-move cancel (book-based): for each of OUR live RFQs, compare the
+  //     rate we'd post NOW against the rate it was posted at (its on-book
+  //     reference_price). If it has drifted past MOVE_CANCEL_BPS, the resting
+  //     offer is stale — the deal is now too far from fair value — so cancel it.
+  //     Book-based (not our in-memory set) so it also protects prior-run orders.
+  for (const r of open.filter(isOursRfq)) {
+    const idStr = String(r.id);
+    if (cancelled.has(idStr)) continue; // already age-cancelled this cycle
+    const posted = Number(r.reference_price);
+    if (!Number.isFinite(posted) || posted <= 0) continue;
+    let sell: string, buy: string;
+    try {
+      const p = parsePair(r.pair);
+      sell = p.base;
+      buy = p.quote;
+    } catch {
       continue;
     }
-    const now = rateOf(info.side.sell, info.side.buy, usd);
-    if (now && Math.abs(now - info.oracleAtPost) / info.oracleAtPost >= MOVE_CANCEL_BPS / 10000) {
-      const movePct = (((now - info.oracleAtPost) / info.oracleAtPost) * 100).toFixed(2);
-      if (DRY_RUN) {
-        console.log(`[seeder] DRY RUN: WOULD cancel ${info.side.pair} ${idHex.slice(0, 8)} — oracle moved ${movePct}%`);
-      } else {
-        const c = await signer!.cancelRfq({ rfq_id: info.rfqId, reason: "price-move" });
-        console.log(
-          c.ok
-            ? `[seeder] ✗ cancelled ${info.side.pair} ${idHex.slice(0, 8)} — oracle moved ${movePct}%`
-            : `[seeder] cancel failed ${idHex.slice(0, 8)}: ${c.code}: ${c.detail}`,
-        );
-      }
-      cancelled.add(idHex);
-      mine.delete(idHex);
+    if (usd[sell] == null || usd[buy] == null) continue;
+    const isSupra = sell === "SUPRA" || buy === "SUPRA";
+    const nowTarget = rateOf(sell, buy, usd) * (isSupra ? 1 - SUPRA_EDGE_BPS / 10000 : 1);
+    const drift = Math.abs(nowTarget - posted) / posted;
+    if (drift < MOVE_CANCEL_BPS / 10000) continue;
+    const pct = (((nowTarget - posted) / posted) * 100).toFixed(2);
+    if (DRY_RUN) {
+      console.log(`[seeder] DRY RUN: WOULD cancel ${r.pair} ${idStr.slice(0, 8)} — price moved ${pct}%`);
+    } else {
+      const c = await signer!.cancelRfq({ rfq_id: uuidToBytes16(idStr), reason: "price-move" });
+      console.log(
+        c.ok
+          ? `[seeder] ✗ cancelled ${r.pair} ${idStr.slice(0, 8)} — price moved ${pct}%`
+          : `[seeder] cancel failed ${idStr.slice(0, 8)}: ${c.code}: ${c.detail}`,
+      );
     }
+    cancelled.add(idStr);
+    mine.delete(idStr);
   }
 
   // 2. Balances, for sizing + sufficiency.
