@@ -111,16 +111,27 @@ async function oracleUsdt(token: string): Promise<number | null> {
   }
 }
 
-/** USD price of every token we trade, from native feeds only. Returns null if
- *  ANY is unavailable — we never post on partial pricing. Cross-rates are then
- *  derived (usd[sell]/usd[buy]), which is internally consistent and avoids the
- *  unreliable per-cross-pair oracle lookups. */
+// Last successful USD price per token, so a transient oracle blip doesn't
+// stall the whole cycle. Only fall back to a cached price if it's recent.
+const lastGoodUsd: Record<string, { price: number; ts: number }> = {};
+const USD_CACHE_MAX_MS = Number(process.env.USD_CACHE_MAX_MS ?? 300000); // 5 min
+
+/** USD price of every token we trade, from native feeds — tolerant of a
+ *  transient miss (uses a recent cached price). Returns null only if a token
+ *  has no fresh AND no recent-cached price, since we never post mispriced. */
 async function usdPrices(): Promise<Record<string, number> | null> {
   const out: Record<string, number> = { USDT: 1 };
+  const now = Date.now();
   for (const t of ["USDC", "ETH", "SUPRA"]) {
-    const p = await oracleUsdt(t);
-    if (!p) return null;
-    out[t] = p;
+    const fresh = await oracleUsdt(t);
+    if (fresh) {
+      lastGoodUsd[t] = { price: fresh, ts: now };
+      out[t] = fresh;
+    } else if (lastGoodUsd[t] && now - lastGoodUsd[t].ts <= USD_CACHE_MAX_MS) {
+      out[t] = lastGoodUsd[t].price; // tolerate a blip with a recent price
+    } else {
+      return null; // no usable price for this token
+    }
   }
   return out;
 }
@@ -130,13 +141,23 @@ function rateOf(sell: string, buy: string, usd: Record<string, number>): number 
   return usd[sell] / usd[buy];
 }
 
+/** An RFQ is "live" only if it's open AND not past its expiry. The platform
+ *  list currently returns expired RFQs still marked open, which otherwise
+ *  fools our depth count and makes us think our own expired orders are up. */
+function isLive(rfq: any, now: number): boolean {
+  if (rfq.status !== "open") return false;
+  const exp = rfq.expires_at ? Date.parse(rfq.expires_at) : NaN;
+  return !Number.isFinite(exp) || exp > now; // missing/unparseable expiry => treat as live
+}
+
 async function fetchOpenRfqs(): Promise<any[]> {
   const r = await fetchWithTimeout(
     `${BASE_URL}/api/suprafx/rfqs?scope=platform&status=open&limit=200`,
   );
   if (!r.ok) return [];
   const j = (await r.json()) as { data?: any[] };
-  return (j.data ?? []).filter((rfq) => rfq.status === "open");
+  const now = Date.now();
+  return (j.data ?? []).filter((rfq) => isLive(rfq, now)); // drop expired zombies
 }
 
 async function main() {
