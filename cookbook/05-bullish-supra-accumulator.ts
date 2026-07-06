@@ -134,9 +134,14 @@ async function fetchSupraSellers(): Promise<any[]> {
   );
   if (!r.ok) return [];
   const j = (await r.json()) as { data?: any[] };
-  return (j.data ?? []).filter(
-    (rfq) => rfq.status === "open" && PAIRS.includes(rfq.pair),
-  );
+  const now = Date.now();
+  // The platform list returns expired RFQs still marked "open" — skip those,
+  // we can't fill an expired seller.
+  return (j.data ?? []).filter((rfq) => {
+    if (rfq.status !== "open" || !PAIRS.includes(rfq.pair)) return false;
+    const exp = rfq.expires_at ? Date.parse(rfq.expires_at) : NaN;
+    return !Number.isFinite(exp) || exp > now;
+  });
 }
 
 
