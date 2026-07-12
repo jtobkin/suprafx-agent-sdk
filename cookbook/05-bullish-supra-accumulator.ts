@@ -169,11 +169,22 @@ async function main() {
   );
 
   // Poll loop: sequential, never overlapping, resilient to transient errors.
+  // Self-heal a stuck connection pool (e.g. after a wifi drop): after
+  // MAX_CONSEC_FAILS consecutive poll failures, exit so pm2 relaunches us
+  // with fresh sockets. A single success resets the counter.
+  const MAX_CONSEC_FAILS = Number(process.env.MAX_CONSEC_FAILS ?? 10);
+  let consecFails = 0;
   for (;;) {
     try {
       await pollOnce(dec, SUPRA_DEC);
+      consecFails = 0;
     } catch (e) {
-      console.warn(`[accumulator] poll error (continuing): ${(e as Error).message}`);
+      consecFails++;
+      console.warn(`[accumulator] poll error (${consecFails}/${MAX_CONSEC_FAILS}): ${(e as Error).message}`);
+      if (consecFails >= MAX_CONSEC_FAILS) {
+        console.error(`[accumulator] ${consecFails} consecutive failures — exiting for a clean restart (pm2 will relaunch with fresh connections).`);
+        process.exit(1);
+      }
     }
     await sleep(POLL_MS);
   }
