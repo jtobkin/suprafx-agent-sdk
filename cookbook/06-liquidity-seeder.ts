@@ -46,11 +46,11 @@ const RFQ_USD_SIZES = (process.env.RFQ_USD_SIZES ?? String(process.env.RFQ_USD_S
   .split(",")
   .map((s) => Number(s.trim()))
   .filter((n) => Number.isFinite(n) && n > 0);
-let sizeCursor = 0;
+// Pick a random notional from the blend per post, so sizes spread evenly
+// across markets (a round-robin cursor tended to align $5/$10 onto the same
+// few sides). Result: the resting book shows a real mix.
 function nextUsdSize(): number {
-  const s = RFQ_USD_SIZES[sizeCursor % RFQ_USD_SIZES.length];
-  sizeCursor++;
-  return s;
+  return RFQ_USD_SIZES[Math.floor(Math.random() * RFQ_USD_SIZES.length)];
 }
 const SUPRA_EDGE_BPS = Number(process.env.SUPRA_EDGE_BPS ?? 25); // SUPRA offers this much better than oracle
 const MIN_DEPTH = Number(process.env.MIN_DEPTH ?? 2); // post when fewer than this many non-ours on a side
