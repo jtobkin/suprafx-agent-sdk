@@ -39,7 +39,19 @@ const MASTER = process.env.MASTER_ADDRESS!;
 const PRIV = process.env.SUPRAFX_DELEGATE_PRIV_HEX;
 const DRY_RUN = process.env.LIVE !== "1";
 
-const RFQ_USD_SIZE = Number(process.env.RFQ_USD_SIZE ?? 2.5); // per-RFQ notional (<$3)
+// Blend of per-RFQ notionals to cycle through, e.g. "2.5,5,10" — each post
+// takes the next size round-robin so sizes vary across markets. Falls back to
+// a single RFQ_USD_SIZE for backward-compat.
+const RFQ_USD_SIZES = (process.env.RFQ_USD_SIZES ?? String(process.env.RFQ_USD_SIZE ?? 2.5))
+  .split(",")
+  .map((s) => Number(s.trim()))
+  .filter((n) => Number.isFinite(n) && n > 0);
+let sizeCursor = 0;
+function nextUsdSize(): number {
+  const s = RFQ_USD_SIZES[sizeCursor % RFQ_USD_SIZES.length];
+  sizeCursor++;
+  return s;
+}
 const SUPRA_EDGE_BPS = Number(process.env.SUPRA_EDGE_BPS ?? 25); // SUPRA offers this much better than oracle
 const MIN_DEPTH = Number(process.env.MIN_DEPTH ?? 2); // post when fewer than this many non-ours on a side
 const MOVE_CANCEL_BPS = Number(process.env.MOVE_CANCEL_BPS ?? 100); // cancel once oracle moves this far from post (100 = 1%)
@@ -181,7 +193,7 @@ async function main() {
 
   console.log(
     `[seeder] delegate=${signer?.addressHex ?? "(none — dry run)"} sides=${SIDES.length} ` +
-      `size≈$${RFQ_USD_SIZE} supra_edge=${SUPRA_EDGE_BPS}bps min_depth=${MIN_DEPTH} ` +
+      `sizes=$${RFQ_USD_SIZES.join("/$")} supra_edge=${SUPRA_EDGE_BPS}bps min_depth=${MIN_DEPTH} ` +
       `cancel_move=${MOVE_CANCEL_BPS}bps max_active=${MAX_ACTIVE_RFQS} age_cancel=${AGE_CANCEL_MS / 60000}min poll=${POLL_MS / 1000}s`,
   );
 
@@ -315,7 +327,8 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     // fewer buy-per-sell), so users see a better-than-oracle SUPRA offer.
     const target = side.isSupra ? rate * (1 - SUPRA_EDGE_BPS / 10000) : rate;
 
-    const size = RFQ_USD_SIZE / usd[side.sell]; // in sell-token units
+    const usdSize = nextUsdSize(); // cycle the blend of notionals
+    const size = usdSize / usd[side.sell]; // in sell-token units
     if ((avail[side.sell] ?? 0) < size) {
       console.log(
         `[seeder] ${side.pair}: insufficient ${side.sell} (${(avail[side.sell] ?? 0).toPrecision(4)} < ${size.toPrecision(4)}); skipping`,
@@ -326,7 +339,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     const sellDec = dec(side.sell);
     const buyDec = dec(side.buy);
     const line =
-      `${side.pair}: sell ${size.toPrecision(4)} ${side.sell} @ ${target.toPrecision(6)} ${side.buy}/${side.sell} ` +
+      `${side.pair} ($${usdSize}): sell ${size.toPrecision(4)} ${side.sell} @ ${target.toPrecision(6)} ${side.buy}/${side.sell} ` +
       `(oracle ${rate.toPrecision(6)}${side.isSupra ? `, -${SUPRA_EDGE_BPS}bps for counterparty` : ""})`;
 
     if (DRY_RUN) {
