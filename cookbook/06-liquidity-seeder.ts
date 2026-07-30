@@ -53,6 +53,9 @@ function nextUsdSize(): number {
   return RFQ_USD_SIZES[Math.floor(Math.random() * RFQ_USD_SIZES.length)];
 }
 const SUPRA_EDGE_BPS = Number(process.env.SUPRA_EDGE_BPS ?? 25); // SUPRA offers this much better than oracle
+// Auto-accept tolerance: we auto-settle a maker quote that's within this much
+// BELOW our ask (reference_price). 25 = accept quotes within 0.25% of the ask.
+const ACCEPT_TOLERANCE_BPS = Number(process.env.ACCEPT_TOLERANCE_BPS ?? 25);
 const MIN_DEPTH = Number(process.env.MIN_DEPTH ?? 2); // post when fewer than this many non-ours on a side
 const MOVE_CANCEL_BPS = Number(process.env.MOVE_CANCEL_BPS ?? 100); // cancel once oracle moves this far from post (100 = 1%)
 const POLL_MS = Number(process.env.POLL_MS ?? 60000); // 1 minute
@@ -193,7 +196,7 @@ async function main() {
 
   console.log(
     `[seeder] delegate=${signer?.addressHex ?? "(none — dry run)"} sides=${SIDES.length} ` +
-      `sizes=$${RFQ_USD_SIZES.join("/$")} supra_edge=${SUPRA_EDGE_BPS}bps min_depth=${MIN_DEPTH} ` +
+      `sizes=$${RFQ_USD_SIZES.join("/$")} supra_edge=${SUPRA_EDGE_BPS}bps accept_tol=${ACCEPT_TOLERANCE_BPS}bps min_depth=${MIN_DEPTH} ` +
       `cancel_move=${MOVE_CANCEL_BPS}bps max_active=${MAX_ACTIVE_RFQS} age_cancel=${AGE_CANCEL_MS / 60000}min poll=${POLL_MS / 1000}s`,
   );
 
@@ -326,6 +329,8 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     // SUPRA sides: shade the rate in the counterparty's favor (we accept
     // fewer buy-per-sell), so users see a better-than-oracle SUPRA offer.
     const target = side.isSupra ? rate * (1 - SUPRA_EDGE_BPS / 10000) : rate;
+    // Auto-accept anything within ACCEPT_TOLERANCE_BPS below the ask.
+    const acceptRate = target * (1 - ACCEPT_TOLERANCE_BPS / 10000);
 
     const usdSize = nextUsdSize(); // cycle the blend of notionals
     const size = usdSize / usd[side.sell]; // in sell-token units
@@ -340,7 +345,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     const buyDec = dec(side.buy);
     const line =
       `${side.pair} ($${usdSize}): sell ${size.toPrecision(4)} ${side.sell} @ ${target.toPrecision(6)} ${side.buy}/${side.sell} ` +
-      `(oracle ${rate.toPrecision(6)}${side.isSupra ? `, -${SUPRA_EDGE_BPS}bps for counterparty` : ""})`;
+      `(oracle ${rate.toPrecision(6)}${side.isSupra ? `, -${SUPRA_EDGE_BPS}bps` : ""}; auto-accept ≥ ${acceptRate.toPrecision(6)}, i.e. within ${ACCEPT_TOLERANCE_BPS}bps of ask)`;
 
     if (DRY_RUN) {
       console.log(`[seeder] DRY RUN: WOULD post ${line} — not signing.`);
@@ -363,7 +368,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
       size: toMicroUnits(size, sellDec),
       reference_price: toRateBFT(target, sellDec, buyDec),
       auto_accept: true,
-      auto_accept_target_rate: toRateBFT(target, sellDec, buyDec),
+      auto_accept_target_rate: toRateBFT(acceptRate, sellDec, buyDec),
       allow_partial_fills: false,
       min_fill_size: toMicroUnits(size, sellDec),
       expires_at_ms: BigInt(nowMs() + RFQ_EXPIRE_MIN * 60 * 1000),
