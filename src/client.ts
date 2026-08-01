@@ -44,6 +44,14 @@ export interface PlatformBalance {
   total: number;
 }
 
+/** Public delegate-policy response. Additional venue fields are preserved. */
+export interface DelegatePolicy {
+  active?: boolean;
+  master?: string;
+  master_address?: string;
+  [key: string]: unknown;
+}
+
 export interface OrderbookRfq {
   id: string;
   taker_address: string;
@@ -133,6 +141,15 @@ export class SupraFxClient {
       "/api/platform/balances?address=" + encodeURIComponent(a),
     );
     return j.balances ?? [];
+  }
+
+  /** On-chain policy currently associated with a delegate address. */
+  async getDelegatePolicy(address: string): Promise<DelegatePolicy | null> {
+    const a = address.startsWith("0x") ? address : "0x" + address;
+    const j = await this.get<{ policy?: DelegatePolicy | null }>(
+      "/api/delegate-policy?delegate=" + encodeURIComponent(a),
+    );
+    return j.policy ?? null;
   }
 
   /**

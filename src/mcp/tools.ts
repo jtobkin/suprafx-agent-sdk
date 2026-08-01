@@ -20,6 +20,9 @@ import {
   derivePairIdFromTokens,
 } from "../derive-ids.js";
 import { toMicroUnits, toRateBFT } from "../asset-registry.js";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface ToolContext {
   client: SupraFxClient;
@@ -39,6 +42,16 @@ export interface ToolDef {
 // ─── Read tools ────────────────────────────────────────────────
 
 const readTools: ToolDef[] = [
+  {
+    name: "get_setup_status",
+    description:
+      "Check whether this MCP server is ready to trade: local config, delegate " +
+      "identity, chain connectivity, on-chain policy, sequence, and master balances. " +
+      "Read-only and always available; run this before any write tool.",
+    inputSchema: { type: "object", properties: {} },
+    requiresSigner: false,
+    handler: async (_args, ctx) => await getSetupStatus(ctx),
+  },
   {
     name: "get_chain_info",
     description:
@@ -168,7 +181,8 @@ const writeTools: ToolDef[] = [
       "Sign and submit a SubmitRfq to the chain — become the taker on a " +
       "new RFQ. Locks `size` of `sell_token` from the master's available " +
       "balance. Other agents can quote on this RFQ until it matches, " +
-      "expires (30 min default), or is cancelled.",
+      "expires (30 min default), or is cancelled. Preconditions: delegate configured, " +
+      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -266,7 +280,8 @@ const writeTools: ToolDef[] = [
     description:
       "Sign and submit a PlaceQuote on an existing open RFQ — become the maker. " +
       "Locks `total_payment` of the RFQ's quote_asset from your master balance. " +
-      "If accepted by the taker, the trade settles.",
+      "If accepted by the taker, the trade settles. Preconditions: delegate configured, " +
+      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -329,7 +344,9 @@ const writeTools: ToolDef[] = [
     name: "cancel_rfq",
     description:
       "Sign and submit a CancelRfq — withdraw an open RFQ you previously " +
-      "submitted as taker. Locked balance is released back to available.",
+      "submitted as taker. Locked balance is released back to available. Preconditions: " +
+      "delegate configured, active on-chain policy, and sufficient available master balance; " +
+      "verify with get_setup_status first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -346,7 +363,10 @@ const writeTools: ToolDef[] = [
       const signer = requireSigner(ctx);
       return await signer.cancelRfq({
         rfq_id: uuidToBytes16(args.rfq_id),
-        reason: args.reason ?? "agent_cancel",
+        // The chain mempool TxId hashes the full event. An identical retry is
+        // deduped forever if the first submission was silently dropped, so a
+        // generated reason must be unique on every call.
+        reason: args.reason ?? `agent_cancel-${shortUniqueSuffix()}`,
       });
     },
   },
@@ -355,7 +375,8 @@ const writeTools: ToolDef[] = [
     description:
       "Sign and submit an AcceptQuote — as the taker of the parent RFQ, " +
       "accept a maker's quote and trigger settlement. trade_id is generated " +
-      "client-side if not supplied.",
+      "client-side if not supplied. Preconditions: delegate configured, active " +
+      "on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -381,7 +402,8 @@ const writeTools: ToolDef[] = [
     name: "withdraw_quote",
     description:
       "Sign and submit a WithdrawQuote — as the maker, pull a pending " +
-      "quote off the orderbook before it's accepted.",
+      "quote off the orderbook before it's accepted. Preconditions: delegate configured, " +
+      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -405,16 +427,19 @@ export function allTools(hasSigner: boolean): ToolDef[] {
 }
 
 export function findTool(name: string, hasSigner: boolean): ToolDef | undefined {
-  return allTools(hasSigner).find((t) => t.name === name);
+  // A client may call a previously-discovered write tool after its key is
+  // removed. Keep lookup available so it receives NO_DELEGATE_CONFIGURED.
+  return [...readTools, ...writeTools].find((t) => t.name === name);
 }
 
 // ─── helpers ──────────────────────────────────────────────────
 
 function requireSigner(ctx: ToolContext): DelegateSigner {
   if (!ctx.signer) {
-    throw new Error(
-      "This tool requires a configured delegate key. Run `suprafx-mcp init` " +
-        "to set one up, or set SUPRAFX_DELEGATE_PRIV_HEX in the environment.",
+    throw new ToolError(
+      "NO_DELEGATE_CONFIGURED",
+      "run `suprafx-mcp init` or set SUPRAFX_DELEGATE_PRIV_HEX, then retry",
+      "suprafx-mcp init",
     );
   }
   return ctx.signer;
@@ -457,4 +482,166 @@ function randomBytes16(): Uint8Array {
   const out = new Uint8Array(16);
   crypto.getRandomValues(out);
   return out;
+}
+
+let uniqueReasonCounter = 0;
+
+function shortUniqueSuffix(): string {
+  uniqueReasonCounter = (uniqueReasonCounter + 1) & 0xfffff;
+  return `${Date.now().toString(36)}-${uniqueReasonCounter.toString(36)}-${Array.from(crypto.getRandomValues(new Uint8Array(3)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+export class ToolError extends Error {
+  constructor(
+    readonly code: string,
+    readonly detail: string,
+    readonly remedy: string,
+  ) {
+    super(detail);
+  }
+}
+
+type CheckState = "ok" | "warn" | "fail" | "unknown";
+interface SetupCheck {
+  status: CheckState;
+  detail: string;
+  remedy: string;
+}
+
+async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupCheck>> {
+  const configPath = join(homedir(), ".suprafx", "config.json");
+  const configPresent = existsSync(configPath);
+  const report: Record<string, SetupCheck> = {
+    config_file: configPresent
+      ? { status: "ok", detail: `config file present at ${configPath}`, remedy: "suprafx-mcp" }
+      : {
+          status: ctx.signer ? "warn" : "fail",
+          detail: ctx.signer
+            ? "config file absent; delegate key was loaded from the environment"
+            : `config file absent at ${configPath}`,
+          remedy: "suprafx-mcp init",
+        },
+    delegate_key: ctx.signer
+      ? { status: "ok", detail: `delegate address ${ctx.signer.addressHex}`, remedy: "suprafx-mcp" }
+      : {
+          status: "fail",
+          detail: "no delegate key is loaded",
+          remedy: "suprafx-mcp init",
+        },
+    chain_reachable: {
+      status: "unknown",
+      detail: "chain connectivity not checked yet",
+      remedy: "suprafx-mcp",
+    },
+    delegate_policy: {
+      status: "unknown",
+      detail: "requires a loaded delegate address",
+      remedy: "suprafx-mcp init",
+    },
+    sequence_number: {
+      status: "unknown",
+      detail: "requires a loaded delegate address",
+      remedy: "suprafx-mcp init",
+    },
+    master_balances: {
+      status: "unknown",
+      detail: "requires a master address returned by the delegate-policy endpoint",
+      remedy: "suprafx-mcp init",
+    },
+  };
+
+  try {
+    const info = await ctx.client.getChainInfo();
+    report.chain_reachable = {
+      status: "ok",
+      detail: `chain reachable (${info.chainId})`,
+      remedy: "suprafx-mcp",
+    };
+  } catch (e) {
+    report.chain_reachable = {
+      status: "fail",
+      detail: errorMessage(e),
+      remedy: "curl -f https://suprafx.ai/api/council/chain-info",
+    };
+  }
+
+  if (!ctx.signer) return report;
+  const delegate = ctx.signer.addressHex;
+  try {
+    const next = await ctx.client.getSequenceNumber(delegate);
+    report.sequence_number = {
+      status: "ok",
+      detail: `next sequence number ${next}`,
+      remedy: `curl -f 'https://suprafx.ai/api/council/sequence-number?address=${delegate}'`,
+    };
+  } catch (e) {
+    report.sequence_number = {
+      status: "unknown",
+      detail: errorMessage(e),
+      remedy: `curl -f 'https://suprafx.ai/api/council/sequence-number?address=${delegate}'`,
+    };
+  }
+
+  try {
+    const policy = await ctx.client.getDelegatePolicy(delegate);
+    if (!policy) {
+      report.delegate_policy = {
+        status: "fail",
+        detail: "no on-chain delegate policy found",
+        remedy: "open https://suprafx.ai/profile and create or reactivate this delegate",
+      };
+      return report;
+    }
+    report.delegate_policy = policy.active === false
+      ? {
+          status: "fail",
+          detail: "delegate policy exists but is inactive",
+          remedy: "open https://suprafx.ai/profile and create or reactivate this delegate",
+        }
+      : {
+          status: policy.active === true ? "ok" : "warn",
+          detail: policy.active === true
+            ? "active on-chain delegate policy found"
+            : "delegate policy found, but the response did not state whether it is active",
+          remedy: `curl -f 'https://suprafx.ai/api/delegate-policy?delegate=${delegate}'`,
+        };
+    const master = typeof policy.master_address === "string"
+      ? policy.master_address
+      : typeof policy.master === "string" ? policy.master : null;
+    if (!master) {
+      report.master_balances = {
+        status: "unknown",
+        detail: "delegate policy response did not expose a master address",
+        remedy: `curl -f 'https://suprafx.ai/api/delegate-policy?delegate=${delegate}'`,
+      };
+      return report;
+    }
+    try {
+      const balances = await ctx.client.getBalances(master);
+      report.master_balances = {
+        status: balances.length > 0 ? "ok" : "warn",
+        detail: balances.length > 0
+          ? `master ${master} has ${balances.length} balance row(s): ${JSON.stringify(balances)}`
+          : `master ${master} has no balance rows`,
+        remedy: `curl -f 'https://suprafx.ai/api/platform/balances?address=${master}'`,
+      };
+    } catch (e) {
+      report.master_balances = {
+        status: "unknown",
+        detail: errorMessage(e),
+        remedy: `curl -f 'https://suprafx.ai/api/platform/balances?address=${master}'`,
+      };
+    }
+  } catch (e) {
+    report.delegate_policy = {
+      status: "unknown",
+      detail: errorMessage(e),
+      remedy: `curl -f 'https://suprafx.ai/api/delegate-policy?delegate=${delegate}'`,
+    };
+  }
+  return report;
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }

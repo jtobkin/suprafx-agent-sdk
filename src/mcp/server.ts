@@ -15,7 +15,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { SupraFxClient } from "../client.js";
 import { DelegateSigner } from "../signer.js";
-import { allTools, findTool, type ToolContext } from "./tools.js";
+import { allTools, findTool, ToolError, type ToolContext } from "./tools.js";
 import { loadConfig } from "./config.js";
 
 export interface MCPServerOptions {
@@ -125,6 +125,9 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
     }
     try {
       const result = await tool.handler(req.params.arguments ?? {}, ctx);
+      if (isRejectedEnvelope(result)) {
+        return mcpError(envelopeError(result));
+      }
       return {
         content: [
           {
@@ -134,15 +137,7 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
         ],
       };
     } catch (e) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `Error: ${e instanceof Error ? e.message : String(e)}`,
-          },
-        ],
-      };
+      return mcpError(normalizeError(e));
     }
   });
 
@@ -151,6 +146,71 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
   process.stderr.write(
     `[suprafx-mcp] connected (delegate=${ctx.signer?.addressHex ?? "none"}, base=${opts.baseUrl ?? "https://suprafx.ai"}, hot-reload=on)\n`,
   );
+}
+
+interface ActionableError {
+  code: string;
+  detail: string;
+  remedy: string;
+}
+
+function isRejectedEnvelope(value: unknown): value is {
+  ok: false;
+  code?: string;
+  detail?: string;
+} {
+  return typeof value === "object" && value !== null && "ok" in value && value.ok === false;
+}
+
+function envelopeError(result: { code?: string; detail?: string }): ActionableError {
+  const upstream = result.code ? `${result.code}: ` : "";
+  const detail = result.detail ?? "the venue rejected the signed envelope";
+  if (/sequence|replay|strict.next|high.water/i.test(`${result.code ?? ""} ${detail}`)) {
+    return {
+      code: "SEQUENCE_MISMATCH",
+      detail: upstream + detail,
+      remedy: "run `get_setup_status`, re-fetch the delegate sequence number, then retry",
+    };
+  }
+  return {
+    code: "ENVELOPE_REJECTED",
+    detail: upstream + detail,
+    remedy: "run `get_setup_status`, fix the reported policy or balance issue, then retry",
+  };
+}
+
+function normalizeError(e: unknown): ActionableError {
+  if (e instanceof ToolError) {
+    return { code: e.code, detail: e.detail, remedy: e.remedy };
+  }
+  const detail = e instanceof Error ? e.message : String(e);
+  if (
+    e instanceof TypeError ||
+    /fetch|network|timed? ?out|abort|ECONN|ENOTFOUND|GET \/api|POST \/api/i.test(detail)
+  ) {
+    return {
+      code: "NETWORK_FAILURE",
+      detail,
+      remedy: "run `get_setup_status`, verify SUPRAFX_BASE_URL and connectivity, then retry",
+    };
+  }
+  return {
+    code: "TOOL_EXECUTION_FAILED",
+    detail,
+    remedy: "run `get_setup_status`, correct the tool inputs shown in detail, then retry",
+  };
+}
+
+function mcpError(error: ActionableError) {
+  return {
+    isError: true as const,
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(error, null, 2),
+      },
+    ],
+  };
 }
 
 /** JSON.stringify replacer that handles BigInt and Uint8Array. */
