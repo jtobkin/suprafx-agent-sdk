@@ -82,6 +82,7 @@ export class SupraFxClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private cachedChainInfo: ChainInfo | null = null;
+  private cachedClockOffset: { offsetMs: number; expiresAtMs: number } | null = null;
 
   constructor(opts: SupraFxClientOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, "");
@@ -103,6 +104,44 @@ export class SupraFxClient {
     }
     this.cachedChainInfo = j;
     return j;
+  }
+
+  /**
+   * Difference between the venue's HTTP clock and the local clock.
+   * Best-effort only: expiry calculation must remain available when the
+   * header or endpoint is unavailable.
+   */
+  async getVenueClockOffsetMs(): Promise<number> {
+    const now = Date.now();
+    if (this.cachedClockOffset && now < this.cachedClockOffset.expiresAtMs) {
+      return this.cachedClockOffset.offsetMs;
+    }
+
+    let offsetMs = 0;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
+      try {
+        const r = await fetch(this.baseUrl + "/api/council/chain-info", {
+          signal: ctrl.signal,
+          headers: { accept: "application/json" },
+        });
+        const serverDateMs = Date.parse(r.headers.get("date") ?? "");
+        if (Number.isFinite(serverDateMs)) {
+          offsetMs = serverDateMs - Date.now();
+        }
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      // Clock alignment is advisory; never prevent a trade on failure.
+    }
+
+    this.cachedClockOffset = {
+      offsetMs,
+      expiresAtMs: Date.now() + 5 * 60_000,
+    };
+    return offsetMs;
   }
 
   /** Current committed batch height. Useful for `expires_at_batch` math. */
