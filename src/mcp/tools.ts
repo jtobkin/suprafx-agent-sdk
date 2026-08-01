@@ -250,8 +250,10 @@ const writeTools: ToolDef[] = [
         args.buy_token,
       );
       const currentBatch = BigInt(await ctx.client.getCurrentBatch());
+      const clockOffsetMs = await ctx.client.getVenueClockOffsetMs();
+      warnIfClockSkewed(clockOffsetMs);
       const expiresAtMs = BigInt(
-        Date.now() + (args.expires_in_minutes ?? 30) * 60 * 1000,
+        Date.now() + clockOffsetMs + (args.expires_in_minutes ?? 30) * 60 * 1000,
       );
       const allowPartial = !!args.allow_partial_fills;
       return await signer.submitRfq({
@@ -508,6 +510,20 @@ interface SetupCheck {
   remedy: string;
 }
 
+const CLOCK_SKEW_WARNING_MS = 60_000;
+
+function clockSkewSeconds(offsetMs: number): number {
+  return Math.sign(offsetMs) * Math.ceil(Math.abs(offsetMs) / 1000);
+}
+
+function warnIfClockSkewed(offsetMs: number): void {
+  if (Math.abs(offsetMs) > CLOCK_SKEW_WARNING_MS) {
+    console.error(
+      `local clock skewed by ${clockSkewSeconds(offsetMs)}s vs venue; using server-aligned expiry`,
+    );
+  }
+}
+
 async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupCheck>> {
   const configPath = join(homedir(), ".suprafx", "config.json");
   const configPresent = existsSync(configPath);
@@ -532,6 +548,11 @@ async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupChe
       status: "unknown",
       detail: "chain connectivity not checked yet",
       remedy: "suprafx-mcp",
+    },
+    clock_skew: {
+      status: "unknown",
+      detail: "venue clock offset not checked yet",
+      remedy: "sync your system clock (NTP)",
     },
     delegate_policy: {
       status: "unknown",
@@ -564,6 +585,20 @@ async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupChe
       remedy: "curl -f https://suprafx.ai/api/council/chain-info",
     };
   }
+
+  const clockOffsetMs = await ctx.client.getVenueClockOffsetMs();
+  const skewSeconds = clockSkewSeconds(clockOffsetMs);
+  report.clock_skew = Math.abs(clockOffsetMs) > CLOCK_SKEW_WARNING_MS
+    ? {
+        status: "warn",
+        detail: `local clock is skewed by ${skewSeconds}s versus the venue`,
+        remedy: "sync your system clock (NTP)",
+      }
+    : {
+        status: "ok",
+        detail: `local clock skew is ${skewSeconds}s versus the venue`,
+        remedy: "sync your system clock (NTP)",
+      };
 
   if (!ctx.signer) return report;
   const delegate = ctx.signer.addressHex;
