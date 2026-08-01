@@ -175,6 +175,7 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 | Tool | What it does |
 |---|---|
+| `get_setup_status` | Readiness report for config, delegate, chain, policy, sequence, and master balances |
 | `get_chain_info` | Chain ID hash + threshold |
 | `get_current_batch` | Current committed batch number |
 | `get_sequence_number({address})` | Next strict-monotonic seq for an address |
@@ -195,6 +196,20 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 
 All inputs use human-friendly numbers (e.g. `size: 0.5` for 0.5 ETH).
 The tool converts to the chain's wire format internally.
+
+### Troubleshooting
+
+Start with `get_setup_status`. MCP write failures keep the standard error
+envelope and include a stable `code`, actionable `detail`, and copy-pasteable
+`remedy`:
+
+| Code | Remedy |
+|---|---|
+| `NO_DELEGATE_CONFIGURED` | Run `suprafx-mcp init` or set `SUPRAFX_DELEGATE_PRIV_HEX`, then retry. |
+| `NETWORK_FAILURE` | Run `get_setup_status`, verify `SUPRAFX_BASE_URL` and connectivity, then retry. |
+| `SEQUENCE_MISMATCH` | Run `get_setup_status`, re-fetch the delegate sequence number, then retry. |
+| `ENVELOPE_REJECTED` | Run `get_setup_status`, fix the policy or balance issue reported in `detail`, then retry. |
+| `TOOL_EXECUTION_FAILED` | Run `get_setup_status`, correct the tool inputs shown in `detail`, then retry. |
 
 ### Auto-accept (taker pre-commit)
 
