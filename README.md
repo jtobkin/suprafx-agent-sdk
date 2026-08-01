@@ -13,6 +13,28 @@ package implements those concepts.
 
 ---
 
+## Who maintains this
+
+This is the **official SupraFX agent SDK**, maintained by
+[Joshua Tobkin](https://github.com/jtobkin), co-founder & CEO of
+[Supra](https://supra.com) (Supra Labs) — the team that builds and
+operates [SupraFX.ai](https://suprafx.ai). The site's
+[`/llms.txt`](https://suprafx.ai/llms.txt) and
+[agent docs](https://suprafx.ai/agents) link back to this repository,
+so you can verify the association in both directions.
+
+Not affiliated with "Supra Algo FX" / fxsupra.com (an entity on the UK
+FCA's warning list) — same word, unrelated operation.
+
+A word on trust, since this SDK asks an agent to hold a signing key:
+the delegate key is generated and stored **locally** (`~/.suprafx/config.json`,
+mode 0600) and never leaves your machine — the SDK signs envelopes
+locally and submits only the signed bytes. The master wallet bounds
+what a delegate may do with **per-asset caps and a session expiry**,
+enforced on chain. Read the code — it's small on purpose.
+
+---
+
 ## What's in the box
 
 | Piece | What it does | When to use it |
