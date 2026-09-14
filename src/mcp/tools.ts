@@ -1,11 +1,16 @@
 /**
  * MCP tool definitions + handlers for SupraFX.
  *
- * Split into READ tools (always available) and WRITE tools (only
- * available when a delegate key is configured). Each tool's input
- * schema is hand-written to match the JSON the model passes; the
- * handler converts human-friendly inputs (e.g. `size: 0.5` for 0.5
- * ETH) into the chain's wire encoding internally.
+ * DESIGN RULE: everything an agent needs in order to trade safely lives
+ * in the TOOL CONTRACT — the description it reads before calling, the
+ * lifecycle field it gets back, the structured error it gets on failure.
+ * Nothing important is left to prose in a doc the agent may never fetch.
+ *
+ * Tools are split into three classes, selectable at launch
+ * (`--tools=read,cancel`):
+ *   read   — always available, cannot move money
+ *   trade  — opens or fills a position (submit_rfq, place_quote, accept_quote)
+ *   cancel — releases a position (cancel_rfq, withdraw_quote)
  *
  * Reference: docs/INTEGRATING-AGENTS.md
  */
@@ -14,20 +19,39 @@ import type {
   SupraFxClient,
   AssetInfo,
 } from "../client.js";
+import { SupraFxError } from "../client.js";
 import type { DelegateSigner } from "../signer.js";
 import {
   deriveAssetId,
   derivePairIdFromTokens,
+  canonicalChain,
 } from "../derive-ids.js";
 import { toMicroUnits, toRateBFT } from "../asset-registry.js";
+import {
+  withLifecycle,
+  findRfq,
+  findQuote,
+  sameId,
+  type CommitResult,
+} from "./lifecycle.js";
+import { runPreflight, ORACLE_STALE_MS } from "./preflight.js";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+export type ToolGroup = "read" | "trade" | "cancel";
+export type GateMode = "guarded" | "autonomous";
 
 export interface ToolContext {
   client: SupraFxClient;
   /** Present only when a delegate key is configured. */
   signer: DelegateSigner | null;
+  /** The operator's master address, if known. Balances live here. */
+  masterAddress?: string | null;
+  /** `guarded` requires `acknowledged:true` on every money tool. */
+  mode?: GateMode;
+  /** Which tool classes this server was launched with. */
+  groups?: Set<string>;
 }
 
 export interface ToolDef {
@@ -36,8 +60,52 @@ export interface ToolDef {
   inputSchema: object;
   /** Requires a configured delegate key (write tool). */
   requiresSigner: boolean;
+  /** Tool class, for launch-time selection. Defaults to read. */
+  group?: ToolGroup;
+  /** Money-moving: gated behind `acknowledged` in guarded mode. */
+  dangerous?: boolean;
   handler: (args: any, ctx: ToolContext) => Promise<unknown>;
 }
+
+// ─── Shared description fragments ──────────────────────────────
+//
+// The known failure modes, annotated AT THE TOOL. An agent reads the
+// trap here instead of paying for it once and writing it in a notebook
+// nobody else can see.
+
+const OK_IS_NOT_COMMITTED =
+  "OUTCOME: this tool returns a `lifecycle` field — `applied` (a state " +
+  "read confirmed it landed), `rejected` (ingress refused it), or " +
+  "`unknown` (ingress accepted it but the confirming read did not see it " +
+  "in time). `ok:true` on its own NEVER means committed. Treat `unknown` " +
+  "as 'I do not know yet': do NOT retry blindly, read state back.";
+
+const ACK_NOTE =
+  "GUARDED MODE: this tool moves real money and requires `acknowledged: true` " +
+  "on every call. Launch the server with `--allow-dangerous` (or " +
+  "SUPRAFX_ALLOW_DANGEROUS=1) for an autonomous loop that should not stop " +
+  "to acknowledge each write.";
+
+const GHOST_LOCK_NOTE =
+  "TRAP — ghost locks: collateral can stay locked with no order visibly " +
+  "holding it (expiry and other-maker-accepted paths do not always release). " +
+  "`list_my_open_orders` shows every order of yours that is still holding " +
+  "funds, which is what tells a real lock apart from a ghost one.";
+
+const PRECONDITIONS =
+  "Preconditions: delegate configured, active on-chain policy, and " +
+  "sufficient available master balance — verify with `get_setup_status` " +
+  "and `preflight` first.";
+
+const ACK_PROPERTY = {
+  acknowledged: {
+    type: "boolean",
+    description:
+      "Required in guarded mode (the default). Set true to confirm you intend " +
+      "this real-money write. Not required when the server runs with " +
+      "--allow-dangerous / SUPRAFX_ALLOW_DANGEROUS=1.",
+  },
+} as const;
 
 // ─── Read tools ────────────────────────────────────────────────
 
@@ -105,23 +173,43 @@ const readTools: ToolDef[] = [
   {
     name: "get_balances",
     description:
-      "Return the master's available + locked balances per asset. " +
-      "Pass the master's Supra address (NOT the delegate's — delegates " +
-      "have no balances of their own).",
+      "Return the MASTER's available + locked balances per asset. Delegates " +
+      "have no balances of their own. `address` is optional when a master " +
+      "address is configured (see `get_master_address`). " +
+      "`locked_in_rfq` is trading collateral, `locked_in_orders` is quote-side; " +
+      "locked is shared across ALL your open orders, so locked>0 with no " +
+      "matching order of yours is the ghost-lock signal — check " +
+      "`list_my_open_orders` first. " +
+      "This is the TIE-BREAKER read: whenever a write returns `unknown`, come " +
+      "here rather than guessing or retrying.",
     inputSchema: {
       type: "object",
       properties: {
         address: {
           type: "string",
-          description: "0x-prefixed 32-byte master Supra address",
+          description:
+            "0x-prefixed 32-byte MASTER Supra address. Omit to use the configured master.",
         },
       },
-      required: ["address"],
     },
     requiresSigner: false,
-    handler: async (args, ctx) => ({
-      balances: await ctx.client.getBalances(args.address),
-    }),
+    group: "read",
+    handler: async (args, ctx) => {
+      const address = args.address ?? ctx.masterAddress;
+      if (!address) {
+        throw new ToolError(
+          "NO_MASTER_ADDRESS",
+          "get_balances needs a master address and none is configured",
+          "ask the operator for their master StarKey address and set " +
+            "SUPRAFX_MASTER_ADDRESS so it survives a restart",
+        );
+      }
+      return {
+        address,
+        source: args.address ? "argument" : "configured",
+        balances: await ctx.client.getBalances(address),
+      };
+    },
   },
   {
     name: "get_orderbook",
@@ -170,6 +258,176 @@ const readTools: ToolDef[] = [
       };
     },
   },
+  {
+    name: "get_master_address",
+    description:
+      "Return the operator's MASTER address — the account that holds the " +
+      "funds, as opposed to the delegate this server signs as. " +
+      "Balance, lock and open-order reads all key on the master, so without " +
+      "it verification breaks on any context reset. If it is not configured " +
+      "this returns `configured:false` and the exact fix — ask the operator, " +
+      "never guess an address.",
+    inputSchema: { type: "object", properties: {} },
+    requiresSigner: false,
+    group: "read",
+    handler: async (_args, ctx) => {
+      if (!ctx.masterAddress) {
+        return {
+          master_address: null,
+          configured: false,
+          how_to_fix:
+            "Ask the operator for the StarKey address they connected to " +
+            "suprafx.ai with, then export SUPRAFX_MASTER_ADDRESS=0x… or add " +
+            '"masterAddress" to ~/.suprafx/config.json and reconnect. ' +
+            "`suprafx-mcp init` also asks for it.",
+        };
+      }
+      return { master_address: ctx.masterAddress, configured: true };
+    },
+  },
+  {
+    name: "list_my_open_orders",
+    description:
+      "EVERY order of yours that is still holding locked funds — RFQs you " +
+      "took, quotes you made — each with the action that releases it. " +
+      "This is the answer to 'where did my money go'. Run it before treating " +
+      "any lock as a ghost-lock, and after every cancel to confirm release. " +
+      "Uses the configured master address unless you pass one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        address: {
+          type: "string",
+          description: "MASTER address. Omit to use the configured master.",
+        },
+      },
+    },
+    requiresSigner: false,
+    group: "read",
+    handler: async (args, ctx) => {
+      const address = (args.address ?? ctx.masterAddress) as string | null;
+      if (!address) {
+        throw new ToolError(
+          "NO_MASTER_ADDRESS",
+          "list_my_open_orders needs a master address and none is configured",
+          "set SUPRAFX_MASTER_ADDRESS, or pass `address` — see `get_master_address`",
+        );
+      }
+      const me = address.toLowerCase();
+      const rows = [
+        ...(await ctx.client.getOrderbook({ status: "open", limit: 200 })),
+        ...(await ctx.client.getOrderbook({ status: "expired", limit: 200 })),
+      ];
+      const myRfqs: unknown[] = [];
+      const myQuotes: unknown[] = [];
+      for (const r of rows as any[]) {
+        const expired = r.expires_at ? Date.parse(r.expires_at) < Date.now() : false;
+        if (String(r.taker_address ?? "").toLowerCase() === me) {
+          myRfqs.push({
+            rfq_id: r.id,
+            role: "taker",
+            pair: r.pair,
+            size: r.size,
+            remaining_size: r.remaining_size,
+            status: r.status,
+            expires_at: r.expires_at,
+            expired,
+            holds_collateral: true,
+            release_with: `cancel_rfq({ rfq_id: "${r.id}", acknowledged: true })`,
+          });
+        }
+        for (const q of (r.quotes ?? []) as any[]) {
+          if (String(q.maker_address ?? "").toLowerCase() !== me) continue;
+          if (q.status && !["open", "pending", "active"].includes(String(q.status))) continue;
+          myQuotes.push({
+            quote_id: q.id,
+            role: "maker",
+            on_rfq: r.id,
+            pair: r.pair,
+            rate: q.rate,
+            status: q.status,
+            parent_rfq_status: r.status,
+            parent_rfq_expired: expired,
+            holds_collateral: true,
+            release_with: `withdraw_quote({ quote_id: "${q.id}", acknowledged: true })`,
+          });
+        }
+      }
+      const balances = await ctx.client.getBalances(address).catch(() => []);
+      const total = myRfqs.length + myQuotes.length;
+      return {
+        address,
+        open_rfqs_as_taker: myRfqs,
+        open_quotes_as_maker: myQuotes,
+        total_open: total,
+        locked_balances: balances
+          .filter((b) => (b.locked_in_rfq ?? 0) > 0 || (b.locked_in_orders ?? 0) > 0)
+          .map((b) => ({
+            asset: b.asset,
+            available: b.available,
+            locked_in_rfq: b.locked_in_rfq,
+            locked_in_orders: b.locked_in_orders,
+          })),
+        note:
+          total === 0
+            ? "No open orders of yours. If balances still show locked funds, that " +
+              "is a GHOST LOCK — you cannot clear it yourself; report it to the venue."
+            : "Each row above holds collateral. Release it with the named call, " +
+              "then re-read get_balances to confirm the funds returned to available.",
+      };
+    },
+  },
+  {
+    name: "get_oracle_price",
+    description:
+      "Venue fair value for a pair, with the quote's AGE. Quote against this, " +
+      `never an external price. A quote older than ${ORACLE_STALE_MS / 1000}s is ` +
+      "unusable — `stale:true` means do not quote.",
+    inputSchema: {
+      type: "object",
+      properties: { pair: { type: "string", description: "e.g. 'ETH/USDC'" } },
+      required: ["pair"],
+    },
+    requiresSigner: false,
+    group: "read",
+    handler: async (args, ctx) => {
+      const o = await ctx.client.getOracle(args.pair);
+      return {
+        ...o,
+        stale: o.ageMs == null ? null : o.ageMs > ORACLE_STALE_MS,
+        stale_limit_ms: ORACLE_STALE_MS,
+      };
+    },
+  },
+  {
+    name: "preflight",
+    description:
+      "Run every check that decides whether it is safe to trade right now, " +
+      "each with the ACTION that clears it: venue reachable, venue batch " +
+      "actually advancing (not just the L1), venue assets resolving to " +
+      "registered ids, oracle freshness, custody, sequence drift, funding, " +
+      "and stale own-RFQs still holding collateral. Run on connect and after " +
+      "any surprise. `ready_to_trade:false` means stop and read `checks`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pair: {
+          type: "string",
+          description: "Pair to check oracle freshness against, e.g. 'ETH/USDC'",
+        },
+      },
+    },
+    requiresSigner: false,
+    group: "read",
+    handler: async (args, ctx) =>
+      await runPreflight({
+        client: ctx.client,
+        signer: ctx.signer,
+        masterAddress: ctx.masterAddress ?? null,
+        mode: ctx.signer ? (ctx.mode ?? "guarded") : "read_only",
+        pair: args.pair,
+      }),
+  },
 ];
 
 // ─── Write tools ───────────────────────────────────────────────
@@ -178,24 +436,32 @@ const writeTools: ToolDef[] = [
   {
     name: "submit_rfq",
     description:
-      "Sign and submit a SubmitRfq to the chain — become the taker on a " +
-      "new RFQ. Locks `size` of `sell_token` from the master's available " +
-      "balance. Other agents can quote on this RFQ until it matches, " +
-      "expires (30 min default), or is cancelled. Preconditions: delegate configured, " +
-      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
+      "Sign and submit a SubmitRfq — become the taker on a new RFQ. " +
+      "LOCKS `size` of `sell_token` from the master's available balance " +
+      "until it matches, expires (30 min default), or you cancel it. " +
+      `${OK_IS_NOT_COMMITTED} ` +
+      "Confirmed by reading the RFQ back off the orderbook. " +
+      "TRAP — an RFQ with an already-past expiry, or min_fill_size > size, " +
+      "can commit and then sit dead while holding your collateral; both are " +
+      "refused here before they can lock anything. " +
+      `${GHOST_LOCK_NOTE} ${ACK_NOTE} ${PRECONDITIONS}`,
     inputSchema: {
       type: "object",
       properties: {
         sell_chain: {
           type: "string",
           description:
-            "Canonical chain id of the asset you're selling (e.g. 'eth-mainnet', 'supra-mainnet')",
+            "Chain of the asset you're selling. EITHER spelling works: " +
+            "'ethereum' (as list_assets returns it) or 'eth-mainnet' (canonical).",
         },
         sell_token: {
           type: "string",
           description: "Symbol of the asset you're selling (e.g. 'ETH', 'USDC')",
         },
-        buy_chain: { type: "string", description: "Canonical chain id of the asset you want" },
+        buy_chain: {
+          type: "string",
+          description: "Chain of the asset you want. Either spelling works.",
+        },
         buy_token: { type: "string", description: "Symbol of the asset you want" },
         size: {
           type: "number",
@@ -225,6 +491,7 @@ const writeTools: ToolDef[] = [
           description: "If true, auto-accept the first quote at or better than auto_accept_target_rate",
         },
         auto_accept_target_rate: { type: "number", description: "Required if auto_accept=true" },
+        ...ACK_PROPERTY,
       },
       required: [
         "sell_chain",
@@ -236,8 +503,12 @@ const writeTools: ToolDef[] = [
       ],
     },
     requiresSigner: true,
+    group: "trade",
+    dangerous: true,
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
+      requireAck(args, ctx, "submit_rfq");
+      const expiresInMinutes = assertRfqIsFillable(args);
       const assets = await ctx.client.listAssets();
       const baseDec = assetDecimals(assets, args.sell_chain, args.sell_token);
       const quoteDec = assetDecimals(assets, args.buy_chain, args.buy_token);
@@ -253,10 +524,12 @@ const writeTools: ToolDef[] = [
       const clockOffsetMs = await ctx.client.getVenueClockOffsetMs();
       warnIfClockSkewed(clockOffsetMs);
       const expiresAtMs = BigInt(
-        Date.now() + clockOffsetMs + (args.expires_in_minutes ?? 30) * 60 * 1000,
+        Date.now() + clockOffsetMs + expiresInMinutes * 60 * 1000,
       );
       const allowPartial = !!args.allow_partial_fills;
-      return await signer.submitRfq({
+      const rfqIdBytes = randomBytes16();
+      const rfqUuid = bytes16ToUuid(rfqIdBytes);
+      const res = await signer.submitRfq({
         pair,
         base_asset: baseAsset,
         quote_asset: quoteAsset,
@@ -271,19 +544,29 @@ const writeTools: ToolDef[] = [
           ? toMicroUnits(args.min_fill_size ?? 0, baseDec)
           : BigInt(0),
         expires_at_ms: expiresAtMs,
-        rfq_id: randomBytes16(),
+        rfq_id: rfqIdBytes,
         settlement_mode:
           args.settlement_mode === "OnChain" ? "OnChain" : "Platform",
       });
+      const commit = await withLifecycle(res, {
+        verifiedBy: `get_orderbook for rfq_id ${rfqUuid}`,
+        tieBreaker: `get_balances, and list_my_open_orders for rfq_id ${rfqUuid}`,
+        check: async () => (await findRfq(ctx.client, rfqUuid)) != null,
+      });
+      return { rfq_id: rfqUuid, ...commit };
     },
   },
   {
     name: "place_quote",
     description:
-      "Sign and submit a PlaceQuote on an existing open RFQ — become the maker. " +
-      "Locks `total_payment` of the RFQ's quote_asset from your master balance. " +
-      "If accepted by the taker, the trade settles. Preconditions: delegate configured, " +
-      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
+      "Sign and submit a PlaceQuote on an open RFQ — become the maker. " +
+      "LOCKS `total_payment` of the RFQ's quote_asset from your master balance " +
+      "until the taker accepts, the RFQ dies, or you withdraw_quote. " +
+      `${OK_IS_NOT_COMMITTED} ` +
+      "Confirmed by reading the quote back off the parent RFQ. " +
+      "TRAP — a quote's lock is NOT shown anywhere on the taker-side " +
+      "orderbook; use `list_my_open_orders` to see it. " +
+      `${ACK_NOTE} ${PRECONDITIONS}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -305,50 +588,77 @@ const writeTools: ToolDef[] = [
       required: ["rfq_id", "fill_size", "total_payment"],
     },
     requiresSigner: true,
+    group: "trade",
+    dangerous: true,
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
+      requireAck(args, ctx, "place_quote");
+      if (!(args.fill_size > 0) || !(args.total_payment > 0)) {
+        throw new ToolError(
+          "INVALID_QUOTE",
+          "fill_size and total_payment must both be > 0",
+          "pass positive values for both",
+        );
+      }
       // Fetch the parent rfq so we know the pair + decimals.
-      const orderbook = await ctx.client.getOrderbook({ status: "open" });
-      const parent = orderbook.find((r) => r.id === args.rfq_id);
+      const orderbook = await ctx.client.getOrderbook({ status: "open", limit: 200 });
+      const parent = orderbook.find((r) => sameId(r.id, args.rfq_id));
       if (!parent) {
-        throw new Error(
-          `place_quote: rfq ${args.rfq_id} not found in open orderbook`,
+        throw new ToolError(
+          "RFQ_NOT_OPEN",
+          `rfq ${args.rfq_id} is not in the open orderbook`,
+          "it may have matched, expired or been cancelled — re-read `get_orderbook`",
         );
       }
-      // pair shape is "BASE/QUOTE" e.g. "ETH/USDC". source_chain and
-      // dest_chain hold the canonical chain ids per asset.
+      // pair is "BASE/QUOTE" e.g. "ETH/USDC". RFQ rows carry CANONICAL
+      // chain ids ("eth-mainnet") while /api/assets carries SHORT ones
+      // ("ethereum") — comparing them raw never matched, so this threw on
+      // every call. canonicalChain folds both sides.
       const [baseSym, quoteSym] = parent.pair.split("/");
-      const baseDec = (await ctx.client.listAssets()).find(
-        (a) =>
-          a.asset_symbol.toUpperCase() === baseSym &&
-          normalizeChain(a.chain_id) === parent.source_chain,
-      )?.decimals;
-      const quoteDec = (await ctx.client.listAssets()).find(
-        (a) =>
-          a.asset_symbol.toUpperCase() === quoteSym &&
-          normalizeChain(a.chain_id) === parent.dest_chain,
-      )?.decimals;
+      const assets = await ctx.client.listAssets();
+      const findDec = (sym: string, chain: string) =>
+        assets.find(
+          (a) =>
+            a.asset_symbol.toUpperCase() === sym.toUpperCase() &&
+            canonicalChain(a.chain_id) === canonicalChain(chain),
+        )?.decimals;
+      const baseDec = findDec(baseSym, parent.source_chain);
+      const quoteDec = findDec(quoteSym, parent.dest_chain);
       if (baseDec == null || quoteDec == null) {
-        throw new Error(
-          `place_quote: could not resolve decimals for ${parent.pair}`,
+        throw new ToolError(
+          "UNRESOLVED_DECIMALS",
+          `could not resolve decimals for ${parent.pair} (${parent.source_chain} / ${parent.dest_chain})`,
+          "the venue lists an asset this SDK does not know — `npm update -g @suprafx/agent-sdk` and report",
         );
       }
+      const quoteIdBytes = randomBytes16();
+      const quoteUuid = bytes16ToUuid(quoteIdBytes);
       const impliedRate = args.total_payment / args.fill_size;
-      return await signer.placeQuote({
-        rfq_id: uuidToBytes16(args.rfq_id),
-        quote_id: randomBytes16(),
+      const res = await signer.placeQuote({
+        rfq_id: uuidToBytes16(parent.id),
+        quote_id: quoteIdBytes,
         rate: toRateBFT(impliedRate, baseDec, quoteDec),
         fill_size: toMicroUnits(args.fill_size, baseDec),
       });
+      const commit = await withLifecycle(res, {
+        verifiedBy: `get_orderbook — quote ${quoteUuid} on rfq ${parent.id}`,
+        tieBreaker: "get_balances and list_my_open_orders",
+        check: async () => (await findQuote(ctx.client, quoteUuid)) != null,
+      });
+      return { quote_id: quoteUuid, rfq_id: parent.id, implied_rate: impliedRate, ...commit };
     },
   },
   {
     name: "cancel_rfq",
     description:
-      "Sign and submit a CancelRfq — withdraw an open RFQ you previously " +
-      "submitted as taker. Locked balance is released back to available. Preconditions: " +
-      "delegate configured, active on-chain policy, and sufficient available master balance; " +
-      "verify with get_setup_status first.",
+      "Sign and submit a CancelRfq — withdraw an open RFQ you took, releasing " +
+      "its locked collateral back to available. " +
+      `${OK_IS_NOT_COMMITTED} ` +
+      "Confirmed by reading the RFQ's status off the orderbook. " +
+      "ALWAYS re-read `get_balances` after this: confirming the RFQ closed is " +
+      "NOT the same as confirming the funds came back. " +
+      "NOTE — consumes no sequence number, so it cannot desync your counter. " +
+      `${ACK_NOTE} ${PRECONDITIONS}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -357,28 +667,51 @@ const writeTools: ToolDef[] = [
           type: "string",
           description: "Optional human-readable reason (logged on chain)",
         },
+        ...ACK_PROPERTY,
       },
       required: ["rfq_id"],
     },
     requiresSigner: true,
+    group: "cancel",
+    dangerous: true,
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
-      return await signer.cancelRfq({
+      requireAck(args, ctx, "cancel_rfq");
+      const res = await signer.cancelRfq({
         rfq_id: uuidToBytes16(args.rfq_id),
         // The chain mempool TxId hashes the full event. An identical retry is
         // deduped forever if the first submission was silently dropped, so a
         // generated reason must be unique on every call.
         reason: args.reason ?? `agent_cancel-${shortUniqueSuffix()}`,
       });
+      const commit = await withLifecycle(res, {
+        verifiedBy: `get_orderbook — status of rfq ${args.rfq_id}`,
+        tieBreaker: "get_balances — confirm the collateral returned to available",
+        check: async () => {
+          const found = await findRfq(ctx.client, args.rfq_id);
+          if (!found) return false;
+          return String(found.status ?? "").toLowerCase() !== "open";
+        },
+      });
+      return {
+        rfq_id: args.rfq_id,
+        ...commit,
+        next_step:
+          "Re-read get_balances and confirm the locked amount returned to " +
+          "available. Locks do not always release on their own.",
+      };
     },
   },
   {
     name: "accept_quote",
     description:
-      "Sign and submit an AcceptQuote — as the taker of the parent RFQ, " +
-      "accept a maker's quote and trigger settlement. trade_id is generated " +
-      "client-side if not supplied. Preconditions: delegate configured, active " +
-      "on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
+      "Sign and submit an AcceptQuote — as the taker of the parent RFQ, accept " +
+      "a maker's quote and trigger settlement. THIS SPENDS: it is the point of " +
+      "no return for the trade. " +
+      `${OK_IS_NOT_COMMITTED} ` +
+      "Confirmed by reading the quote's status back off the orderbook. " +
+      "trade_id is generated client-side if not supplied. " +
+      `${ACK_NOTE} ${PRECONDITIONS}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -388,50 +721,107 @@ const writeTools: ToolDef[] = [
           description:
             "(Optional) UUID for the resulting trade. Omit to auto-generate",
         },
+        ...ACK_PROPERTY,
       },
       required: ["quote_id"],
     },
     requiresSigner: true,
+    group: "trade",
+    dangerous: true,
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
-      return await signer.acceptQuote({
+      requireAck(args, ctx, "accept_quote");
+      const res = await signer.acceptQuote({
         quote_id: uuidToBytes16(args.quote_id),
         trade_id: args.trade_id ? uuidToBytes16(args.trade_id) : randomBytes16(),
       });
+      const commit = await withLifecycle(res, {
+        verifiedBy: `get_orderbook — status of quote ${args.quote_id}`,
+        tieBreaker: "get_balances (the trade should have moved both assets)",
+        check: async () => {
+          const found = await findQuote(ctx.client, args.quote_id);
+          if (!found) return false;
+          const st = String(found.quote.status ?? "").toLowerCase();
+          return st === "accepted" || found.rfqStatus === "matched";
+        },
+      });
+      return { quote_id: args.quote_id, ...commit };
     },
   },
   {
     name: "withdraw_quote",
     description:
-      "Sign and submit a WithdrawQuote — as the maker, pull a pending " +
-      "quote off the orderbook before it's accepted. Preconditions: delegate configured, " +
-      "active on-chain policy, and sufficient available master balance; verify with get_setup_status first.",
+      "Sign and submit a WithdrawQuote — as the maker, pull a pending quote off " +
+      "the orderbook before it is accepted, releasing its lock. " +
+      "THIS IS NOT A FUND WITHDRAWAL: it does not move money off SupraFX. " +
+      "Getting funds OUT is a master-signed dApp action, and this delegate key " +
+      "cannot do it. " +
+      `${OK_IS_NOT_COMMITTED} ` +
+      "ALWAYS re-read `get_balances` after this. " +
+      "NOTE — consumes no sequence number. " +
+      `${ACK_NOTE} ${PRECONDITIONS}`,
     inputSchema: {
       type: "object",
       properties: {
         quote_id: { type: "string", description: "UUID of the quote to withdraw" },
+        ...ACK_PROPERTY,
       },
       required: ["quote_id"],
     },
     requiresSigner: true,
+    group: "cancel",
+    dangerous: true,
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
-      return await signer.withdrawQuote({
+      requireAck(args, ctx, "withdraw_quote");
+      const res = await signer.withdrawQuote({
         quote_id: uuidToBytes16(args.quote_id),
       });
+      const commit = await withLifecycle(res, {
+        verifiedBy: `get_orderbook — status of quote ${args.quote_id}`,
+        tieBreaker: "get_balances — confirm the lock returned to available",
+        check: async () => {
+          const found = await findQuote(ctx.client, args.quote_id);
+          if (!found) return true; // gone from the book = pulled
+          const st = String(found.quote.status ?? "").toLowerCase();
+          return st !== "open" && st !== "pending" && st !== "active";
+        },
+      });
+      return {
+        quote_id: args.quote_id,
+        ...commit,
+        next_step: "Re-read get_balances and confirm the lock returned to available.",
+      };
     },
   },
 ];
 
-export function allTools(hasSigner: boolean): ToolDef[] {
-  if (hasSigner) return [...readTools, ...writeTools];
-  return readTools;
+/** `read` is never withheld; omitting `groups` exposes every class. */
+function inGroups(t: ToolDef, groups?: Set<string>): boolean {
+  if (!groups) return true;
+  return groups.has(t.group ?? "read");
 }
 
-export function findTool(name: string, hasSigner: boolean): ToolDef | undefined {
+export function allTools(hasSigner: boolean, groups?: Set<string>): ToolDef[] {
+  const reads = readTools.filter((t) => inGroups(t, groups));
+  if (hasSigner) return [...reads, ...writeTools.filter((t) => inGroups(t, groups))];
+  return reads;
+}
+
+export function findTool(
+  name: string,
+  hasSigner: boolean,
+  groups?: Set<string>,
+): ToolDef | undefined {
   // A client may call a previously-discovered write tool after its key is
-  // removed. Keep lookup available so it receives NO_DELEGATE_CONFIGURED.
-  return [...readTools, ...writeTools].find((t) => t.name === name);
+  // removed. Keep lookup available so it receives NO_DELEGATE_CONFIGURED
+  // rather than a confusing "unknown tool".
+  //
+  // A tool excluded by `--tools=` is a DIFFERENT case: the operator chose
+  // not to expose it, so it must not be callable at all.
+  return [...readTools, ...writeTools]
+    .filter((t) => inGroups(t, groups))
+    .find((t) => t.name === name);
 }
 
 // ─── helpers ──────────────────────────────────────────────────
@@ -447,34 +837,43 @@ function requireSigner(ctx: ToolContext): DelegateSigner {
   return ctx.signer;
 }
 
+/**
+ * Decimals for `(chain, symbol)`, comparing chain ids in CANONICAL form.
+ *
+ * This used to fold both sides to the short DB form. That worked for
+ * `/api/assets` (which returns `"ethereum"`) but NOT for RFQ rows (which
+ * return `"eth-mainnet"`), so `place_quote` compared `"ethereum"` against
+ * `"eth-mainnet"`, never matched, and threw on every single call.
+ * `canonicalChain` folds both directions, so either spelling works.
+ */
 function assetDecimals(
   assets: AssetInfo[],
   chain: string,
   symbol: string,
 ): number {
-  const normalizedChain = normalizeChain(chain);
+  const want = canonicalChain(chain);
   const a = assets.find(
     (r) =>
       r.asset_symbol.toUpperCase() === symbol.toUpperCase() &&
-      normalizeChain(r.chain_id) === normalizedChain,
+      canonicalChain(r.chain_id) === want,
   );
   if (!a) {
-    throw new Error(`assetDecimals: ${symbol}@${chain} not in supported assets`);
+    throw new ToolError(
+      "UNSUPPORTED_ASSET",
+      `${symbol}@${chain} is not a supported asset`,
+      "call `list_assets` and use a chain_id and asset_symbol from that list",
+    );
   }
   return a.decimals;
 }
 
-/** Map canonical chain ids to the DB short form used by /api/assets. */
-function normalizeChain(chain: string): string {
-  if (chain === "eth-mainnet") return "ethereum";
-  if (chain === "supra-mainnet") return "supra";
-  if (chain === "eth-sepolia") return "sepolia";
-  return chain;
-}
-
 function uuidToBytes16(uuid: string): Uint8Array {
-  const hex = uuid.replace(/-/g, "");
-  if (hex.length !== 32) throw new Error(`uuidToBytes16: not a uuid: ${uuid}`);
+  // Lower-cased: the venue has returned ids in mixed casing, and an
+  // upper-case id must encode to the same 16 bytes.
+  const hex = uuid.replace(/-/g, "").trim().toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) {
+    throw new ToolError("BAD_UUID", `not a uuid: ${uuid}`, "pass the id exactly as the orderbook returned it");
+  }
   const out = new Uint8Array(16);
   for (let i = 0; i < 16; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   return out;
@@ -484,6 +883,57 @@ function randomBytes16(): Uint8Array {
   const out = new Uint8Array(16);
   crypto.getRandomValues(out);
   return out;
+}
+
+/** Render 16 bytes as a dashed UUID so the id we return matches the one
+ *  the orderbook will show — the only way apply-verification can compare. */
+function bytes16ToUuid(b: Uint8Array): string {
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/**
+ * The guarded gate. Key-presence alone is not a stop: once a key loads,
+ * `accept_quote` was as ungated as `get_orderbook`. In guarded mode every
+ * money tool needs an explicit per-call `acknowledged:true`; an autonomous
+ * loop opts out once, at launch, in the open.
+ */
+function requireAck(args: any, ctx: ToolContext, toolName: string): void {
+  if ((ctx.mode ?? "guarded") === "autonomous") return;
+  if (args?.acknowledged === true) return;
+  throw new ToolError(
+    "NEEDS_ACKNOWLEDGEMENT",
+    `${toolName} moves real money and this server is in GUARDED mode`,
+    "re-send the identical call with `acknowledged: true`; for an autonomous " +
+      "loop the OPERATOR relaunches with --allow-dangerous — do not work around this",
+  );
+}
+
+/** Reject an RFQ that could never fill but would still lock collateral. */
+function assertRfqIsFillable(args: any): number {
+  const expiresInMinutes = args.expires_in_minutes ?? 30;
+  if (!(expiresInMinutes > 0)) {
+    throw new ToolError(
+      "RFQ_DEAD_ON_ARRIVAL",
+      `expires_in_minutes must be > 0 (got ${expiresInMinutes})`,
+      "an already-expired RFQ can commit and lock collateral nobody can fill — pass a positive expiry",
+    );
+  }
+  if (!(args.size > 0)) {
+    throw new ToolError(
+      "RFQ_DEAD_ON_ARRIVAL",
+      `size must be > 0 (got ${args.size})`,
+      "pass a positive size",
+    );
+  }
+  if (args.allow_partial_fills && (args.min_fill_size ?? 0) > args.size) {
+    throw new ToolError(
+      "RFQ_DEAD_ON_ARRIVAL",
+      `min_fill_size (${args.min_fill_size}) exceeds size (${args.size})`,
+      "no fill could satisfy it, but the RFQ would still lock funds — lower min_fill_size",
+    );
+  }
+  return expiresInMinutes;
 }
 
 let uniqueReasonCounter = 0;

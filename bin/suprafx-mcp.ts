@@ -18,7 +18,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { runMCPServer } from "../src/mcp/server.js";
-import { loadConfig } from "../src/mcp/config.js";
+import { loadConfig, resolveMode, resolveToolGroups } from "../src/mcp/config.js";
+
+/** Read the real version from the installed package.json.
+ *  A hard-coded string silently goes stale and then LIES about which
+ *  build is running — exactly the thing `--version` exists to answer. */
+function packageVersion(): string {
+  try {
+    const here = new URL("../package.json", import.meta.url);
+    const pkg = JSON.parse(readFileSync(here, "utf-8")) as { version?: string };
+    if (pkg.version) return pkg.version;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const here = new URL("../../package.json", import.meta.url);
+    const pkg = JSON.parse(readFileSync(here, "utf-8")) as { version?: string };
+    if (pkg.version) return pkg.version;
+  } catch {
+    /* fall through */
+  }
+  return "unknown";
+}
 
 async function main() {
   const cmd = process.argv[2];
@@ -31,19 +52,35 @@ async function main() {
     return;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("@suprafx/agent-sdk 0.1.0");
+    console.log(`@suprafx/agent-sdk ${packageVersion()}`);
     return;
   }
   const cfg = loadConfig();
+  const mode = resolveMode();
+  const groups = resolveToolGroups();
   if (!cfg.delegatePrivKeyHex) {
     process.stderr.write(
       "[suprafx-mcp] no delegate key configured. Running in READ-ONLY mode.\n" +
         "[suprafx-mcp] To enable trading tools, run: `suprafx-mcp init`\n",
     );
+  } else if (mode === "autonomous") {
+    process.stderr.write(
+      "[suprafx-mcp] AUTONOMOUS mode: money tools will NOT ask for per-call\n" +
+        "[suprafx-mcp] acknowledgement. Every write is real money.\n",
+    );
+  }
+  if (!cfg.masterAddress) {
+    process.stderr.write(
+      "[suprafx-mcp] no master address set — balance, lock and open-order reads\n" +
+        "[suprafx-mcp] need it. Set SUPRAFX_MASTER_ADDRESS or re-run `suprafx-mcp init`.\n",
+    );
   }
   await runMCPServer({
     baseUrl: cfg.baseUrl,
     delegatePrivKeyHex: cfg.delegatePrivKeyHex,
+    masterAddress: cfg.masterAddress,
+    mode,
+    groups,
   });
 }
 
@@ -55,10 +92,30 @@ Usage:
   suprafx-mcp            Run the MCP server over stdio (default for Claude Desktop)
   suprafx-mcp init       Interactive setup wizard — writes ~/.suprafx/config.json
   suprafx-mcp --help     Show this help
+  suprafx-mcp --version  Print the installed package version
+
+Flags:
+  --tools=read                Expose ONLY read tools, even with a key loaded
+                              (a keyed monitor agent that cannot trade).
+                              Also: --tools=read,cancel  (cancel-only)
+                                    --tools=read,trade   (no cancel class)
+                              Default: every class the key entitles you to.
+  --allow-dangerous           AUTONOMOUS mode: money tools stop requiring a
+                              per-call 'acknowledged:true'. Without this the
+                              server is GUARDED — every write asks once.
 
 Environment overrides:
   SUPRAFX_DELEGATE_PRIV_HEX   Hex of delegate ed25519 private key (32 bytes)
+  SUPRAFX_MASTER_ADDRESS      Your MASTER StarKey address — balances, locks and
+                              open orders all live there, not on the delegate
   SUPRAFX_BASE_URL            Override the dApp base URL (default https://suprafx.ai)
+  SUPRAFX_ALLOW_DANGEROUS=1   Same as --allow-dangerous
+  SUPRAFX_TOOLS=read,cancel   Same as --tools=
+
+One-line install (Claude Code):
+
+  npm install -g @suprafx/agent-sdk
+  claude mcp add --scope user suprafx -- suprafx-mcp
 
 Configure Claude Desktop by adding this to your claude_desktop_config.json:
 
@@ -124,14 +181,36 @@ async function initWizard() {
     );
   }
 
+  console.log("");
+  console.log("Now your MASTER StarKey address — the wallet you connected to");
+  console.log("suprafx.ai with, that holds the funds. Your agent needs it to read");
+  console.log("balances and locks; the delegate has no balances of its own.");
+  console.log("Saving it here means the agent never has to be told it again.");
+  console.log("");
+  let masterAddress = await ask("Master StarKey address (0x…, or enter to skip): ");
+  masterAddress = masterAddress.trim().toLowerCase();
+  if (masterAddress.length > 0) {
+    const m = masterAddress.startsWith("0x") ? masterAddress.slice(2) : masterAddress;
+    if (!/^[0-9a-f]{64}$/.test(m)) {
+      rl.close();
+      throw new Error(
+        `Expected a 32-byte hex address (64 hex chars, 0x-prefixed). Got ${m.length} chars.`,
+      );
+    }
+    masterAddress = "0x" + m;
+  }
+
   const baseUrl = await ask(
     "SupraFX base URL (press enter for https://suprafx.ai): ",
   );
   rl.close();
 
-  const cfg: { delegatePrivKeyHex: string; baseUrl?: string } = {
-    delegatePrivKeyHex: privHex,
-  };
+  const cfg: {
+    delegatePrivKeyHex: string;
+    baseUrl?: string;
+    masterAddress?: string;
+  } = { delegatePrivKeyHex: privHex };
+  if (masterAddress.length > 0) cfg.masterAddress = masterAddress;
   if (baseUrl.length > 0) cfg.baseUrl = baseUrl;
 
   const cfgDir = join(homedir(), ".suprafx");
@@ -148,7 +227,16 @@ async function initWizard() {
 
   console.log(`\n✓ Saved to ${cfgPath} (mode 600 — owner read/write only)`);
   console.log("");
-  console.log("Next: add this to your Claude Desktop config:");
+  if (!cfg.masterAddress) {
+    console.log("⚠ No master address saved. Balance and open-order reads will need");
+    console.log("  one passed by hand every session. Re-run `suprafx-mcp init` to add it.");
+    console.log("");
+  }
+  console.log("Next — Claude Code, one line:");
+  console.log("");
+  console.log("  claude mcp add --scope user suprafx -- suprafx-mcp");
+  console.log("");
+  console.log("Or add this to your Claude Desktop config:");
   console.log("");
   console.log("  ~/Library/Application Support/Claude/claude_desktop_config.json");
   console.log("");
@@ -160,7 +248,12 @@ async function initWizard() {
     }
   }`);
   console.log("");
-  console.log("Restart Claude Desktop. SupraFX tools will appear in the tool palette.");
+  console.log("Restart / reconnect. SupraFX tools will appear in the tool palette —");
+  console.log("the key is read at STARTUP, so a running server will not see it until then.");
+  console.log("");
+  console.log("The server starts GUARDED: every money tool asks for an explicit");
+  console.log("acknowledgement per call. For an unattended loop, launch it with");
+  console.log("--allow-dangerous. For a monitor that must never trade: --tools=read.");
   console.log("");
 }
 

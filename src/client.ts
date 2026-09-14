@@ -27,6 +27,9 @@ export interface ChainInfo {
   chainId: string;
   chainIdHashHex: string;
   threshold: number;
+  /** Live venue also returns these; optional so older deployments parse. */
+  validatorCount?: number;
+  stateMachineVersion?: number;
 }
 
 export interface AssetInfo {
@@ -76,6 +79,90 @@ export interface SubmitResult {
   code?: string;
   detail?: string;
   per_validator?: unknown[];
+}
+
+/**
+ * Stable, machine-readable error categories. An agent can branch on
+ * `code` without parsing prose, and `action` names the one thing that
+ * clears it. Mirrors the envelope Kraken ships on every command.
+ */
+export type SupraFxErrorCode =
+  | "auth"
+  | "rate_limit"
+  | "validation"
+  | "not_found"
+  | "api"
+  | "network"
+  | "timeout"
+  | "seq_desync"
+  | "needs_acknowledgement"
+  | "read_only";
+
+export type SupraFxErrorAction =
+  | "authenticate"
+  | "backoff"
+  | "fix_input"
+  | "reconnect"
+  | "configure_key"
+  | "acknowledge"
+  | "retry"
+  | "report";
+
+/** An error carrying a stable category and the action that clears it. */
+export class SupraFxError extends Error {
+  readonly code: SupraFxErrorCode;
+  readonly action: SupraFxErrorAction;
+  readonly status?: number;
+  readonly detail?: unknown;
+  constructor(
+    code: SupraFxErrorCode,
+    action: SupraFxErrorAction,
+    message: string,
+    opts: { status?: number; detail?: unknown } = {},
+  ) {
+    super(message);
+    this.name = "SupraFxError";
+    this.code = code;
+    this.action = action;
+    this.status = opts.status;
+    this.detail = opts.detail;
+  }
+  /** The JSON body an MCP handler returns on failure. */
+  toEnvelope(): {
+    error: SupraFxErrorCode;
+    action: SupraFxErrorAction;
+    message: string;
+    status?: number;
+    detail?: unknown;
+  } {
+    return {
+      error: this.code,
+      action: this.action,
+      message: this.message,
+      ...(this.status != null ? { status: this.status } : {}),
+      ...(this.detail !== undefined ? { detail: this.detail } : {}),
+    };
+  }
+}
+
+/** Map an HTTP status onto the stable category + its clearing action. */
+function classifyStatus(status: number): {
+  code: SupraFxErrorCode;
+  action: SupraFxErrorAction;
+} {
+  if (status === 401 || status === 403) return { code: "auth", action: "authenticate" };
+  if (status === 404) return { code: "not_found", action: "fix_input" };
+  if (status === 429) return { code: "rate_limit", action: "backoff" };
+  if (status >= 400 && status < 500) return { code: "validation", action: "fix_input" };
+  return { code: "api", action: "retry" };
+}
+
+export interface OracleQuote {
+  pair: string;
+  conversionRate: number | null;
+  updatedAt: number | null;
+  /** Age of the quote in ms at read time. */
+  ageMs: number | null;
 }
 
 export class SupraFxClient {
@@ -204,10 +291,39 @@ export class SupraFxClient {
     if (filters.pair) qs.set("pair", filters.pair);
     if (filters.status) qs.set("status", filters.status);
     if (filters.limit) qs.set("limit", String(filters.limit));
-    const j = await this.get<{ rfqs?: OrderbookRfq[] }>(
-      "/api/suprafx/rfqs?" + qs.toString(),
-    );
-    return j.rfqs ?? [];
+    // RESPONSE SHAPE. `/api/suprafx/rfqs` answers
+    // `{ success, data, count, hasMore, ... }` — the rows are under
+    // `data`, NOT `rfqs`. Reading only `rfqs` made this silently return
+    // an EMPTY array for every call (verified live 2026-09-14: the API
+    // returned 3 matched RFQs, this method returned 0). That blinded
+    // `get_orderbook` and made `place_quote` unable to find any parent
+    // RFQ. Accept `data` first, keep `rfqs` as a fallback so an older or
+    // proxied deployment still works.
+    const j = await this.get<{
+      data?: OrderbookRfq[];
+      rfqs?: OrderbookRfq[];
+    }>("/api/suprafx/rfqs?" + qs.toString());
+    return j.data ?? j.rfqs ?? [];
+  }
+
+  /**
+   * Venue oracle quote for `pair` (e.g. `"ETH/USDC"`), with the quote's
+   * age computed at read time. Quote against THIS, never an external
+   * price — and never against a stale one (see `ORACLE_STALE_MS`).
+   */
+  async getOracle(pair: string): Promise<OracleQuote> {
+    const j = await this.get<{
+      pair?: string;
+      conversionRate?: number | null;
+      updatedAt?: number | null;
+    }>("/api/oracle?pair=" + encodeURIComponent(pair));
+    const updatedAt = typeof j.updatedAt === "number" ? j.updatedAt : null;
+    return {
+      pair: j.pair ?? pair,
+      conversionRate: typeof j.conversionRate === "number" ? j.conversionRate : null,
+      updatedAt,
+      ageMs: updatedAt != null ? Date.now() - updatedAt : null,
+    };
   }
 
   // ─── Writes ────────────────────────────────────────────────────
@@ -233,12 +349,36 @@ export class SupraFxClient {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
-      const r = await fetch(this.baseUrl + path, {
-        signal: ctrl.signal,
-        headers: { accept: "application/json" },
-      });
+      let r: Response;
+      try {
+        r = await fetch(this.baseUrl + path, {
+          signal: ctrl.signal,
+          headers: { accept: "application/json" },
+        });
+      } catch (e) {
+        // An AbortError here is our own timeout firing, not a caller cancel.
+        if (ctrl.signal.aborted) {
+          throw new SupraFxError(
+            "timeout",
+            "retry",
+            `GET ${path} timed out after ${this.timeoutMs}ms`,
+          );
+        }
+        throw new SupraFxError(
+          "network",
+          "retry",
+          `GET ${path} failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
       if (!r.ok) {
-        throw new Error(`GET ${path} → ${r.status} ${r.statusText}`);
+        const { code, action } = classifyStatus(r.status);
+        const body = await r.text().catch(() => "");
+        throw new SupraFxError(
+          code,
+          action,
+          `GET ${path} → ${r.status} ${r.statusText}`,
+          { status: r.status, detail: body.slice(0, 400) || undefined },
+        );
       }
       return (await r.json()) as T;
     } finally {
@@ -250,12 +390,35 @@ export class SupraFxClient {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
-      const r = await fetch(this.baseUrl + path, {
-        method: "POST",
-        signal: ctrl.signal,
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      let r: Response;
+      try {
+        r = await fetch(this.baseUrl + path, {
+          method: "POST",
+          signal: ctrl.signal,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        if (ctrl.signal.aborted) {
+          throw new SupraFxError(
+            "timeout",
+            "report",
+            `POST ${path} timed out after ${this.timeoutMs}ms — the write may ` +
+              `or may not have reached the venue; READ STATE BACK before retrying`,
+          );
+        }
+        throw new SupraFxError(
+          "network",
+          "report",
+          `POST ${path} failed: ${e instanceof Error ? e.message : String(e)} — ` +
+            `the write may or may not have landed; READ STATE BACK before retrying`,
+        );
+      }
+      if (r.status === 429) {
+        throw new SupraFxError("rate_limit", "backoff", `POST ${path} → 429`, {
+          status: 429,
+        });
+      }
       // Truth signal is body.ok per INTEGRATING-AGENTS §2 — Cloudflare
       // may strip 5xx bodies, so we don't trust status alone. Parse
       // both 2xx and 4xx bodies and let the caller inspect the code.

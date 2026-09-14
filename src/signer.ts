@@ -40,6 +40,26 @@ const CHAIN_SAW_IT_CODES: ReadonlySet<string> = new Set([
   "auth_failed",
 ]);
 
+/**
+ * The event kinds that actually CARRY a `user_sequence_number` in their
+ * BCS payload, and therefore consume a sequence slot on chain.
+ *
+ * WHY THIS GATE EXISTS. `CancelRfq` and `WithdrawQuote` have no
+ * `user_sequence_number` field at all (see `event-bcs.ts`
+ * `CancelRfqEvent` / `WithdrawQuoteEvent`) — their replay protection is
+ * the uniqueness of `rfq_id` / `quote_id`. But `sendEnvelope` used to
+ * advance `nextSeq` on ANY `ok === true`, so a single cancel or quote
+ * withdrawal pushed the local counter one ahead of the chain's. Every
+ * later trade then signed a seq the chain had already consumed, and the
+ * chain drops a replayed seq SILENTLY — `ok:true` at ingress, never
+ * committed. One cancel desynced every trade after it until reconnect.
+ */
+const CONSUMES_SEQ: ReadonlySet<UserEvent["kind"]> = new Set([
+  "SubmitRfq",
+  "PlaceQuote",
+  "AcceptQuote",
+]);
+
 export interface DelegateSignerOptions {
   /** 32-byte ed25519 private key as hex (with or without 0x prefix). */
   delegatePrivKeyHex: string;
@@ -130,13 +150,17 @@ export class DelegateSigner {
       envelopeBcsHex,
     );
 
-    if (res.ok === true) {
-      this.nextSeq = this.nextSeq + 1n;
-    } else if (res.code && CHAIN_SAW_IT_CODES.has(res.code)) {
-      // Chain saw the envelope but rejected. Seq slot is consumed.
-      this.nextSeq = this.nextSeq + 1n;
+    // Only seq-BEARING events may move the counter. A cancel/withdraw
+    // returning ok:true must leave it exactly where it was.
+    if (CONSUMES_SEQ.has(event.kind)) {
+      if (res.ok === true) {
+        this.nextSeq = this.nextSeq + 1n;
+      } else if (res.code && CHAIN_SAW_IT_CODES.has(res.code)) {
+        // Chain saw the envelope but rejected. Seq slot is consumed.
+        this.nextSeq = this.nextSeq + 1n;
+      }
+      // Otherwise (ingress-level reject): seq unchanged.
     }
-    // Otherwise (ingress-level reject): seq unchanged.
 
     return { ...res, envelopeBcsHex };
   }

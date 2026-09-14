@@ -5,6 +5,19 @@ import { SupraFxClient as Client } from "../client.js";
 import type { DelegateSigner } from "../signer.js";
 import { findTool, ToolError, type ToolContext } from "./tools.js";
 
+/**
+ * NOTE (guarded gate): money tools now require `acknowledged: true` per
+ * call unless the server was launched autonomous (`--allow-dangerous`).
+ * These tests exercise handler behaviour, not the gate — they pass
+ * `mode: "autonomous"` in the context so the gate is not the thing under
+ * test. The gate itself is covered in `test/regressions.test.ts`.
+ */
+
+// These handlers drive stub clients with no orderbook, so apply-confirmation
+// has nothing to read. Skip the confirmation poll entirely — the lifecycle
+// contract itself is covered in `test/regressions.test.ts`.
+process.env.SUPRAFX_APPLY_POLL_MS = "0";
+
 const rfqId = "00000000-0000-0000-0000-000000000001";
 
 test("a write tool without a signer returns NO_DELEGATE_CONFIGURED", async () => {
@@ -29,7 +42,7 @@ test("cancel_rfq generates a distinct default reason per call", async () => {
       return { ok: true };
     },
   } as unknown as DelegateSigner;
-  const ctx: ToolContext = { client: {} as SupraFxClient, signer };
+  const ctx: ToolContext = { client: {} as SupraFxClient, signer, mode: "autonomous" };
   const tool = findTool("cancel_rfq", true);
   assert.ok(tool);
   await tool.handler({ rfq_id: rfqId }, ctx);
@@ -46,7 +59,7 @@ test("cancel_rfq leaves an explicit reason untouched", async () => {
       return { ok: true };
     },
   } as unknown as DelegateSigner;
-  const ctx: ToolContext = { client: {} as SupraFxClient, signer };
+  const ctx: ToolContext = { client: {} as SupraFxClient, signer, mode: "autonomous" };
   const tool = findTool("cancel_rfq", true);
   assert.ok(tool);
   await tool.handler({ rfq_id: rfqId, reason: "operator-requested" }, ctx);
@@ -145,12 +158,12 @@ test("submit_rfq uses venue-aligned expiry and warns only beyond 60 seconds", as
     expires_in_minutes: 30,
   };
   try {
-    await tool.handler(args, { client, signer });
+    await tool.handler(args, { client, signer, mode: "autonomous" as const });
     assert.equal(expiries[0], 2_860_000n);
     assert.deepEqual(warnings, []);
 
     offsetMs = 60_001;
-    await tool.handler(args, { client, signer });
+    await tool.handler(args, { client, signer, mode: "autonomous" as const });
     assert.equal(expiries[1], 2_860_001n);
     assert.deepEqual(warnings, [
       "local clock skewed by 61s vs venue; using server-aligned expiry",
