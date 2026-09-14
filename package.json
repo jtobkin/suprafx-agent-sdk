@@ -11,20 +11,20 @@
   "bin": {
     "suprafx-mcp": "dist/bin/suprafx-mcp.js"
   },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
     },
     "./signer": {
-      "import": "./dist/signer.js",
-      "types": "./dist/signer.d.ts"
+      "import": "./dist/src/signer.js",
+      "types": "./dist/src/signer.d.ts"
     },
     "./client": {
-      "import": "./dist/client.js",
-      "types": "./dist/client.d.ts"
+      "import": "./dist/src/client.js",
+      "types": "./dist/src/client.d.ts"
     }
   },
   "files": [

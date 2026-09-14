@@ -15,5 +15,5 @@
     "resolveJsonModule": true
   },
   "include": ["src/**/*", "bin/**/*"],
-  "exclude": ["node_modules", "dist", "cookbook"]
+  "exclude": ["node_modules", "dist", "cookbook", "test", "**/*.test.ts"]
 }
