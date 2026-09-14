@@ -7,9 +7,10 @@ you (or your AI agent) trade on it programmatically — read the
 orderbook, submit RFQs, place quotes, accept fills, all without going
 through the web UI.
 
-The conceptual reference is
-[`docs/INTEGRATING-AGENTS.md`](../docs/INTEGRATING-AGENTS.md). This
-package implements those concepts.
+The conceptual reference is the machine-readable runbook at
+**<https://suprafx.ai/agent-setup.md>** (also served at `/api/agent-setup`).
+This package implements what it describes — and an agent can follow it
+unattended.
 
 ---
 
@@ -58,8 +59,7 @@ npm install -g @suprafx/agent-sdk
 The MCP server signs trades with a *delegate* keypair. Your master
 StarKey wallet authorizes it on chain with per-asset caps and a
 session expiry. See
-[`docs/INTEGRATING-AGENTS.md` §3](../docs/INTEGRATING-AGENTS.md#3-setting-up-a-delegate)
-for the full flow.
+[the runbook, §4](https://suprafx.ai/agent-setup.md) for the full flow.
 
 Short version:
 1. Go to [suprafx.ai](https://suprafx.ai) → connect StarKey
@@ -67,6 +67,19 @@ Short version:
 3. Click "Generate" — a JSON file with the delegate's private key
    downloads to your machine. **Save this file safely.**
 4. Set per-asset caps + expiry, sign with StarKey.
+
+> ### ⚠️ The per-asset cap rule — it is not the intuitive one
+>
+> - **A positive cap is a spend limit.** This is what you normally want.
+> - **An asset left OUT of the cap map cannot be traded at all.** Permission is
+>   deny-by-default, and an empty map authorizes nothing.
+> - **A cap of `0` also means "no trades allowed"** for that asset — fail-closed, safe.
+> - **For "effectively unlimited", use `u64::MAX`** (`18446744073709551615`), exported as
+>   `MAX_CAP`. Not `0`, and not `u128::MAX` (which overflows the validator's arithmetic).
+>
+> If you have seen older SupraFX material saying a cap of `0` means *unlimited* — **it is
+> wrong.** That described a fail-open bug fixed on 2026-06-07 after a whitehat report; one
+> stale code comment repeated it for months afterwards. The contract is the authority.
 
 ### 3. Configure the MCP server
 
@@ -76,6 +89,15 @@ suprafx-mcp init
 
 The wizard prompts for the delegate private key (or the path to the
 JSON file from step 2) and writes `~/.suprafx/config.json` (mode 0600).
+
+It also asks for your **master StarKey address**. Save it: balances, locks and open orders
+all live on the master, not the delegate, so without it an agent has to be told the address
+again every session and loses it on any context reset. Headless equivalent:
+
+```bash
+export SUPRAFX_DELEGATE_PRIV_HEX=<64-hex-char delegate private key>
+export SUPRAFX_MASTER_ADDRESS=0x<master StarKey address>
+```
 
 > **Rotating the delegate?** The MCP server **hot-reloads** the delegate
 > key from `~/.suprafx/config.json` — just edit the file (or re-run
@@ -180,9 +202,13 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 | `get_current_batch` | Current committed batch number |
 | `get_sequence_number({address})` | Next strict-monotonic seq for an address |
 | `list_assets` | All supported assets with decimals |
-| `get_balances({address})` | A master's available + locked balances per asset |
-| `get_orderbook({pair?, status?, limit?})` | Open RFQs (or filter by status) |
+| `get_balances({address?})` | A master's available + locked balances per asset. `address` optional once a master is configured. **The tie-breaker read whenever a write reports `unknown`** |
+| `get_orderbook({pair?, status?, limit?})` | Open RFQs (or filter by status), each with the quotes placed on it |
 | `get_my_identity` | Your delegate address and current seq |
+| `preflight({pair?})` | **Run this on connect.** Nine checks with the action that clears each: venue reachable, venue batch actually advancing (not just the L1), assets resolving to real ids, oracle freshness, custody, sequence drift, funding, stale own-RFQs still holding collateral |
+| `list_my_open_orders({address?})` | **Every order of yours still holding locked funds** — RFQs and quotes — each with the exact call that releases it. The answer to "where did my money go" |
+| `get_master_address` | The master address this server is configured with (the delegate has no balances of its own) |
+| `get_oracle_price({pair})` | Venue fair value **with the quote's age** and a `stale` flag. Never quote against a stale oracle |
 
 ### Write tools (require configured delegate key)
 
@@ -197,6 +223,40 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 All inputs use human-friendly numbers (e.g. `size: 0.5` for 0.5 ETH).
 The tool converts to the chain's wire format internally.
 
+Every write tool also takes **`acknowledged: true`** — see *Guarded mode* below.
+
+### Outcomes: `ok: true` is not proof a trade landed
+
+A write is accepted at *ingress* before the validators apply it. It can be accepted there and
+still be rejected on chain — inactive delegate, cap exhausted, wrong pair, replayed sequence —
+and nothing tells you. So **every write returns a `lifecycle`**:
+
+| `lifecycle` | `applied` | Meaning | What to do |
+|---|---|---|---|
+| `applied` | `true` | A state read **confirmed** it landed | Proceed |
+| `rejected` | `false` | Ingress refused it; nothing committed | Fix and retry |
+| `unknown` | `null` | Accepted, but not confirmed inside the poll window | **Do NOT retry blindly.** Read state back with `get_balances` / `list_my_open_orders` |
+
+**`unknown` is not a failure — it means "I do not know yet".** A blind retry on `unknown` is
+how you end up holding two positions. Tune the confirmation window with
+`SUPRAFX_APPLY_POLL_MS` (default `12000`; `0` disables confirmation).
+
+### Guarded mode, and limiting what an agent can do
+
+The server starts **guarded**: every money tool requires `acknowledged: true` on the call.
+Key-presence alone is not a safety stop — without this, once a key loads, `accept_quote` is as
+ungated as `get_orderbook`.
+
+| Launch | Effect |
+|---|---|
+| `suprafx-mcp` | **Guarded** (default) — each write needs `acknowledged: true` |
+| `suprafx-mcp --allow-dangerous` | **Autonomous** — no per-call acknowledgement, for unattended loops |
+| `suprafx-mcp --tools=read` | Keyed but **zero write tools exposed** — a monitor that cannot trade |
+| `suprafx-mcp --tools=read,cancel` | Reads plus **release-only** (`cancel_rfq`, `withdraw_quote`) |
+
+`--allow-dangerous` is an operator decision, made once, in the open. Env equivalents:
+`SUPRAFX_ALLOW_DANGEROUS=1`, `SUPRAFX_TOOLS=read,cancel`.
+
 ### Troubleshooting
 
 Start with `get_setup_status`. MCP write failures keep the standard error
@@ -210,6 +270,12 @@ envelope and include a stable `code`, actionable `detail`, and copy-pasteable
 | `SEQUENCE_MISMATCH` | Run `get_setup_status`, re-fetch the delegate sequence number, then retry. |
 | `ENVELOPE_REJECTED` | Run `get_setup_status`, fix the policy or balance issue reported in `detail`, then retry. |
 | `TOOL_EXECUTION_FAILED` | Run `get_setup_status`, correct the tool inputs shown in `detail`, then retry. |
+| `NEEDS_ACKNOWLEDGEMENT` | Guarded mode. Re-send the identical call with `acknowledged: true`, or have the operator relaunch with `--allow-dangerous`. |
+| `NO_DELEGATE_CONFIGURED` | Write tool with no key. Run `suprafx-mcp init` (or set `SUPRAFX_DELEGATE_PRIV_HEX`) and reconnect. |
+| `NO_MASTER_ADDRESS` | Set `SUPRAFX_MASTER_ADDRESS`, or pass `address` — see `get_master_address`. |
+| `TOOL_NOT_EXPOSED` | The server was launched with `--tools=…` excluding this class. Only the operator can widen it. |
+| `RFQ_DEAD_ON_ARRIVAL` | The RFQ could never fill (past expiry, `min_fill_size > size`, or `size <= 0`) but would still lock collateral. Fix the inputs. |
+| `RFQ_NOT_OPEN` | The parent RFQ matched, expired or was cancelled. Re-read `get_orderbook`. |
 
 ### Auto-accept (taker pre-commit)
 
@@ -246,12 +312,33 @@ See `cookbook/04-auto-accept-partial-taker.ts`.
 
 ### Fees
 
-- **Trade fee:** taker pays **5 bps** of the quote notional, maker earns
-  a **1 bp** rebate, protocol keeps **4 bps**. Netted at settlement;
-  doesn't change the on-chain rate. Price your quotes accordingly.
-- **Withdrawal fee:** a flat **4000 SUPRA**, paid in SUPRA even for
-  non-SUPRA assets, when a master withdraws to L1. Master-side only (no
-  withdraw tool) — but budget for it to realize PnL.
+**Trade fees are volume-tiered** on 30-day volume. The taker pays; the maker is free and
+becomes **paid** at volume. Netted at settlement — this does not change the on-chain rate,
+so price your quotes accordingly.
+
+| 30-day volume | Taker | Maker |
+|---|---|---|
+| < $100k | 5 bps | 0 |
+| $100k – $1M | 4 bps | 0 |
+| $1M – $10M | 3.5 bps | **−0.5 bps (rebate)** |
+| $10M – $50M | 3 bps | **−1 bps (rebate)** |
+| > $50M | 2.5 bps | **−1.5 bps (rebate)** |
+
+**Withdrawal fee:** **$2 USD worth of SUPRA plus a 20% margin**, always paid in SUPRA even for
+non-SUPRA assets, quoted at spot — so **the SUPRA amount moves with the price**. Read the live
+number before quoting one to anybody:
+
+```bash
+curl https://suprafx.ai/api/platform/withdraw/fee-quote
+```
+
+Master-side only (there is no withdraw tool, and the delegate key cannot withdraw) — but budget
+for it to realize PnL.
+
+> Earlier versions of this README said the withdrawal fee was "a flat 4000 SUPRA" and that
+> makers earn a flat 1 bp rebate. **Both were wrong.** The fee has been USD-denominated since
+> the $2 policy landed, and the maker rebate only starts above $1M of 30-day volume. Never
+> quote a fixed token amount from memory.
 
 ---
 
@@ -307,6 +394,22 @@ Run the flagship with
 
 ---
 
+## The machine-readable runbook
+
+An agent can set itself up with no human walkthrough. Point it at:
+
+```
+https://suprafx.ai/agent-setup.md      (or https://suprafx.ai/api/agent-setup)
+```
+
+Or just paste this to your coding agent:
+
+> *Set up SupraFX for me: fetch https://suprafx.ai/agent-setup.md and follow it.*
+
+It covers install, read-only verification, the two operator steps that need a wallet, the
+cap rule above, the lifecycle contract, and the known failure modes with the check that
+clears each.
+
 ## Hosting and discovery
 
 This package is published as **`@suprafx/agent-sdk`** on npm. The
@@ -314,8 +417,7 @@ canonical landing page is **https://suprafx.ai/agents**, which links
 out to:
 
 - This README + the rest of the cookbook
-- The conceptual doc at
-  [`docs/INTEGRATING-AGENTS.md`](../docs/INTEGRATING-AGENTS.md)
+- The machine-readable runbook at <https://suprafx.ai/agent-setup.md>
 - The source repo on GitHub
 - The npm package page
 
