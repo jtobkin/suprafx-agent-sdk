@@ -284,6 +284,48 @@ export function assetIdFromChainAndToken(
 }
 
 /**
+ * Bridge the SHORT chain ids the venue's `/api/assets` returns
+ * (`"ethereum"`, `"supra"`, `"sepolia"`) to the CANONICAL bridge chain
+ * ids the on-chain AssetId derivation is keyed on (`"eth-mainnet"`,
+ * `"supra-mainnet"`, `"eth-sepolia"`).
+ *
+ * WHY THIS EXISTS (verified against live `https://suprafx.ai/api/assets`
+ * on 2026-09-14). An agent that reads `list_assets` and passes the
+ * `chain_id` it got back straight into a trade — the obvious thing to do
+ * — used to derive the WRONG AssetId, two different ways, both silent:
+ *
+ *   - `"ethereum"` is in no registry key, so `deriveAssetId` fell through
+ *     to the legacy V1 hash and produced a phantom id the validator gate
+ *     rejects.
+ *   - `"supra"` WAS a registry key — pointing at `supra-testnet`. So a
+ *     mainnet SUPRA trade derived the TESTNET SUPRA asset: a well-formed
+ *     id for the wrong chain. Worse than a phantom, because nothing about
+ *     it looks wrong.
+ *
+ * Canonical ids map to themselves, so this is an identity for every
+ * caller that already passes the long form.
+ */
+export function canonicalChain(chain: string): string {
+  switch (chain.trim().toLowerCase()) {
+    case "ethereum":
+    case "eth":
+    case "mainnet":
+    case "eth-mainnet":
+      return "eth-mainnet";
+    case "supra":
+    case "supra-mainnet":
+      return "supra-mainnet";
+    case "sepolia":
+    case "eth-sepolia":
+      return "eth-sepolia";
+    case "supra-testnet":
+      return "supra-testnet";
+    default:
+      return chain.trim().toLowerCase();
+  }
+}
+
+/**
  * Derive a 32-byte AssetId from a UI-friendly `(chain, symbol)` tuple.
  *
  * Resolves through TOKEN_REGISTRY to the canonical
@@ -296,7 +338,7 @@ export function assetIdFromChainAndToken(
  * fail at the validator gate.
  */
 export function deriveAssetId(chain: string, symbol: string): Uint8Array {
-  const key = `${chain.toLowerCase()}/${symbol.toUpperCase()}`;
+  const key = `${canonicalChain(chain)}/${symbol.toUpperCase()}`;
   const spec = TOKEN_REGISTRY.get(key);
   if (spec) {
     return assetIdFromChainAndToken(spec.chainId, spec.tokenBytes);
@@ -322,7 +364,7 @@ export function registeredAssetId(
   chain: string,
   symbol: string,
 ): Uint8Array | null {
-  const key = `${chain.toLowerCase()}/${symbol.toUpperCase()}`;
+  const key = `${canonicalChain(chain)}/${symbol.toUpperCase()}`;
   const spec = TOKEN_REGISTRY.get(key);
   return spec ? assetIdFromChainAndToken(spec.chainId, spec.tokenBytes) : null;
 }

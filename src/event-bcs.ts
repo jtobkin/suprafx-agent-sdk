@@ -320,17 +320,43 @@ export interface WithdrawRequestedEvent {
 
 /**
  * One entry of a delegate's per-asset cap map (Option B). Mirrors the
- * Rust `policy::AssetCap` keyed by its `AssetId`. DENY semantics — an
- * asset with no entry is not tradeable by the delegate.
+ * Rust `policy::AssetCap` keyed by its `AssetId`.
+ *
+ * ═══ ZERO SEMANTICS — VERIFIED AGAINST THE CONTRACT, 2026-09-15 ═══
+ *
+ *   `0n` means **NO TRADES ALLOWED** for this asset (fail-closed).
+ *   It does NOT mean "unlimited".
+ *   An asset with NO ENTRY is also not tradeable (deny-by-absence),
+ *   and an empty map authorizes nothing.
+ *   For "effectively unlimited", use `MAX_CAP` (u64::MAX) below.
+ *
+ * The validator ORIGINALLY treated `0` as unlimited — fail-OPEN, a
+ * whitehat confirmed it exploitable, and it was fixed in
+ * `council-rust/crates/protocol/src/policy.rs` on 2026-06-07. This
+ * comment kept saying "0n = authorized, unlimited" long after the
+ * contract stopped behaving that way, and an onboarding review read it
+ * and concluded a zero cap grants unlimited authority. It does the
+ * opposite. Keep this comment in step with the contract.
  */
 export interface AssetCapEntry {
   /** 32-byte AssetId. */
   asset: Uint8Array;
-  /** Per-trade cap (Amount, micro-units). 0n = authorized, unlimited. */
+  /**
+   * Per-trade cap (Amount, micro-units). `0n` = NO TRADES for this
+   * asset. Use `MAX_CAP` for effectively unlimited.
+   */
   maxTradeSize: bigint;
-  /** Cumulative open-earmark cap. 0n = authorized, unlimited. */
+  /** Cumulative open-earmark cap. Same zero semantics. */
   maxEarmarkTotal: bigint;
 }
+
+/**
+ * The canonical "effectively unlimited" cap sentinel: `u64::MAX`.
+ *
+ * NOT `u128::MAX` — the validator's `checked_add(earmarks, size)`
+ * overflows there. NOT `0n`, which is fail-closed (see above).
+ */
+export const MAX_CAP: bigint = (1n << 64n) - 1n;
 
 /** `DelegatePolicyCreated` payload. Used for session bootstrap. */
 export interface DelegatePolicyCreatedEvent {

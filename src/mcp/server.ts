@@ -13,14 +13,26 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { SupraFxClient } from "../client.js";
+import { SupraFxClient, SupraFxError } from "../client.js";
 import { DelegateSigner } from "../signer.js";
-import { allTools, findTool, ToolError, type ToolContext } from "./tools.js";
+import {
+  allTools,
+  findTool,
+  ToolError,
+  type ToolContext,
+  type GateMode,
+} from "./tools.js";
 import { loadConfig } from "./config.js";
 
 export interface MCPServerOptions {
   baseUrl?: string;
   delegatePrivKeyHex?: string | null;
+  /** Operator's master address — balances and locks live there. */
+  masterAddress?: string | null;
+  /** `guarded` (default) requires per-call acknowledgement on money tools. */
+  mode?: GateMode;
+  /** Tool classes to expose: read / trade / cancel. */
+  groups?: Set<string>;
 }
 
 export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
@@ -41,7 +53,13 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
       );
     }
   }
-  const ctx: ToolContext = { client, signer };
+  const ctx: ToolContext = {
+    client,
+    signer,
+    masterAddress: opts.masterAddress ?? null,
+    mode: opts.mode ?? "guarded",
+    groups: opts.groups ?? new Set(["read", "trade", "cancel"]),
+  };
 
   // HOT-RELOAD of the delegate key. The key in `~/.suprafx/config.json`
   // (or env) can be rotated while this long-lived stdio server runs. Without
@@ -65,6 +83,10 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
   }
   async function doRefreshSigner(): Promise<void> {
     const cfg = loadConfig();
+    // The master address can be filled in after the server started (the
+    // operator pastes it once they find it). Pick it up on every call —
+    // it is not secret and costs nothing to re-read.
+    if (cfg.masterAddress) ctx.masterAddress = cfg.masterAddress;
     if (cfg.delegatePrivKeyHex === currentKey) return; // unchanged — fast path
     const oldAddr = ctx.signer?.addressHex ?? "none";
     if (cfg.delegatePrivKeyHex) {
@@ -104,7 +126,7 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     await refreshSigner();
     return {
-      tools: allTools(!!ctx.signer).map((t) => ({
+      tools: allTools(!!ctx.signer, ctx.groups).map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
@@ -115,12 +137,25 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     await refreshSigner();
     const hasSigner = !!ctx.signer;
-    const tool = findTool(req.params.name, hasSigner);
+    const tool = findTool(req.params.name, hasSigner, ctx.groups);
     if (!tool) {
-      throw new Error(
-        `Unknown tool: ${req.params.name}${
-          !hasSigner ? " (write tools require a delegate key — run `suprafx-mcp init`)" : ""
-        }`,
+      // Distinguish "no such tool" from "the operator did not expose it" —
+      // different problems with different fixes.
+      const knownToSdk = findTool(req.params.name, true);
+      return mcpError(
+        knownToSdk
+          ? {
+              code: "TOOL_NOT_EXPOSED",
+              detail:
+                `${req.params.name} exists but this server was launched with ` +
+                `--tools=${[...(ctx.groups ?? [])].join(",")}`,
+              remedy: "the OPERATOR must relaunch the server with the class you need",
+            }
+          : {
+              code: "UNKNOWN_TOOL",
+              detail: `no tool named ${req.params.name}`,
+              remedy: "call `tools/list` and use a name from it",
+            },
       );
     }
     try {
@@ -144,7 +179,10 @@ export async function runMCPServer(opts: MCPServerOptions = {}): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(
-    `[suprafx-mcp] connected (delegate=${ctx.signer?.addressHex ?? "none"}, base=${opts.baseUrl ?? "https://suprafx.ai"}, hot-reload=on)\n`,
+    `[suprafx-mcp] connected (delegate=${ctx.signer?.addressHex ?? "none"}, ` +
+      `master=${ctx.masterAddress ?? "unset"}, mode=${ctx.signer ? ctx.mode : "read_only"}, ` +
+      `tools=${[...(ctx.groups ?? ["read","trade","cancel"])].join("+")}, base=${opts.baseUrl ?? "https://suprafx.ai"}, ` +
+      `hot-reload=on)\n`,
   );
 }
 
@@ -179,9 +217,36 @@ function envelopeError(result: { code?: string; detail?: string }): ActionableEr
   };
 }
 
+/**
+ * Remedy sentence for each `SupraFxError.action`. The client layer
+ * classifies failures by CATEGORY (auth / rate_limit / seq_desync / …);
+ * this turns that category into the same `{code, detail, remedy}` shape
+ * every other error already uses, so an agent sees ONE envelope no
+ * matter which layer failed.
+ */
+const ACTION_REMEDY: Record<string, string> = {
+  authenticate: "this read needs an authorized caller — ask the operator; do not retry in a loop",
+  backoff: "back off exponentially and retry; do NOT loop",
+  fix_input: "correct the input named in detail, then retry",
+  reconnect: "reconnect the MCP server to re-anchor the delegate sequence, then retry",
+  configure_key:
+    "configure the delegate key (`suprafx-mcp init` or SUPRAFX_DELEGATE_PRIV_HEX) and RECONNECT",
+  acknowledge: "re-send the identical call with `acknowledged: true`",
+  retry: "retry once; if it persists, report it",
+  report:
+    "do NOT retry blindly — read state back (`get_balances`, `list_my_open_orders`) and report",
+};
+
 function normalizeError(e: unknown): ActionableError {
   if (e instanceof ToolError) {
     return { code: e.code, detail: e.detail, remedy: e.remedy };
+  }
+  if (e instanceof SupraFxError) {
+    return {
+      code: e.code.toUpperCase(),
+      detail: e.message,
+      remedy: ACTION_REMEDY[e.action] ?? "run `get_setup_status`, then retry",
+    };
   }
   const detail = e instanceof Error ? e.message : String(e);
   if (
