@@ -52,7 +52,7 @@ async function main() {
     return;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log(`@suprafx/agent-sdk ${packageVersion()}`);
+    console.log(`suprafx-agent-sdk ${packageVersion()}`);
     return;
   }
   const cfg = loadConfig();
@@ -114,7 +114,7 @@ Environment overrides:
 
 One-line install (Claude Code):
 
-  npm install -g @suprafx/agent-sdk
+  npm install -g suprafx-agent-sdk
   claude mcp add --scope user suprafx -- suprafx-mcp
 
 Configure Claude Desktop by adding this to your claude_desktop_config.json:

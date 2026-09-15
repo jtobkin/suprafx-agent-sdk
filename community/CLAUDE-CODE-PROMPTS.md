@@ -96,7 +96,7 @@ delegate is still active. Key from a local .env (gitignored). I launch it live.
 ## 6. Wire up the MCP server — "human-in-the-loop"
 
 ```
-Walk me through installing @suprafx/agent-sdk globally and running
+Walk me through installing suprafx-agent-sdk globally and running
 `suprafx-mcp init`, then add the suprafx MCP server to my Claude Desktop config.
 Explain exactly where my delegate key is stored and confirm it's mode 0600 and
 never networked. Then give me 5 example prompts I can use once it's connected.

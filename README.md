@@ -1,4 +1,4 @@
-# @suprafx/agent-sdk
+# suprafx-agent-sdk
 
 **SDK + MCP server for building autonomous agents on SupraFX.**
 
@@ -40,7 +40,7 @@ enforced on chain. Read the code — it's small on purpose.
 
 | Piece | What it does | When to use it |
 |---|---|---|
-| `@suprafx/agent-sdk` (the JS/TS lib) | Typed client + signer for the SupraFX REST endpoints | You're writing a custom agent in Node/TypeScript |
+| `suprafx-agent-sdk` (the JS/TS lib) | Typed client + signer for the SupraFX REST endpoints | You're writing a custom agent in Node/TypeScript |
 | `suprafx-mcp` (the CLI binary) | An MCP server that exposes SupraFX as tools | You're using Claude Desktop, Cursor, Continue, or any MCP-aware AI agent |
 | `cookbook/` | Runnable example agents (incl. a bullish SUPRA accumulator) | You want a starting point you can fork |
 
@@ -51,7 +51,7 @@ enforced on chain. Read the code — it's small on purpose.
 ### 1. Install
 
 ```bash
-npm install -g @suprafx/agent-sdk
+npm install -g suprafx-agent-sdk
 ```
 
 ### 2. Authorize a delegate (one time)
@@ -160,11 +160,11 @@ don't need to trade.
 ## Quick start — Library use (for custom Node agents)
 
 ```bash
-npm install @suprafx/agent-sdk
+npm install suprafx-agent-sdk
 ```
 
 ```ts
-import { SupraFxClient, DelegateSigner } from "@suprafx/agent-sdk";
+import { SupraFxClient, DelegateSigner } from "suprafx-agent-sdk";
 
 const client = new SupraFxClient();              // defaults to suprafx.ai
 const signer = new DelegateSigner({
@@ -412,7 +412,7 @@ clears each.
 
 ## Hosting and discovery
 
-This package is published as **`@suprafx/agent-sdk`** on npm. The
+This package is published as **`suprafx-agent-sdk`** on npm. The
 canonical landing page is **https://suprafx.ai/agents**, which links
 out to:
 

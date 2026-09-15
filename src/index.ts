@@ -1,5 +1,5 @@
 /**
- * @suprafx/agent-sdk — public API surface.
+ * suprafx-agent-sdk — public API surface.
  *
  * Two main entry points:
  *   - `SupraFxClient` for read endpoints + envelope POST plumbing

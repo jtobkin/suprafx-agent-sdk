@@ -628,7 +628,7 @@ const writeTools: ToolDef[] = [
         throw new ToolError(
           "UNRESOLVED_DECIMALS",
           `could not resolve decimals for ${parent.pair} (${parent.source_chain} / ${parent.dest_chain})`,
-          "the venue lists an asset this SDK does not know — `npm update -g @suprafx/agent-sdk` and report",
+          "the venue lists an asset this SDK does not know — `npm update -g suprafx-agent-sdk` and report",
         );
       }
       const quoteIdBytes = randomBytes16();
