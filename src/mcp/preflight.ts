@@ -128,7 +128,7 @@ export async function runPreflight(opts: PreflightOptions): Promise<PreflightRes
           .join(", ")}`,
         action:
           "Do not trade the unlisted assets — their derived id is a placeholder " +
-          "the validator gate rejects. Update @suprafx/agent-sdk and report.",
+          "the validator gate rejects. Update suprafx-agent-sdk and report.",
       });
     }
   } catch (e) {

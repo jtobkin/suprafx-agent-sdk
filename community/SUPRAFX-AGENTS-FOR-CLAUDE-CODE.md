@@ -139,7 +139,7 @@ npx tsx cookbook/03-counter-arb-taker.ts
 ## Option A — MCP server (human-in-the-loop)
 
 ```bash
-npm install -g @suprafx/agent-sdk
+npm install -g suprafx-agent-sdk
 suprafx-mcp init          # prompts for your delegate key → ~/.suprafx/config.json (0600)
 ```
 
