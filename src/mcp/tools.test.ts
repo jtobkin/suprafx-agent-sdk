@@ -193,3 +193,66 @@ test("get_setup_status reports clock skew beyond 60 seconds", async () => {
   assert.match(result.clock_skew.detail, /-61s/);
   assert.equal(result.clock_skew.remedy, "sync your system clock (NTP)");
 });
+
+// ─── get_deposit_status ───────────────────────────────────────────
+//
+// The tool exists so an agent can tell "still crediting" from "failed"
+// without looping on balances. These pin its routing: a (chain, tx_hash)
+// pair reads ONE claim, nothing lists the configured master, and a half
+// key is refused instead of silently becoming a list.
+
+test("get_deposit_status reads one claim when chain and tx_hash are both given", async () => {
+  const seen: unknown[] = [];
+  const client = {
+    getDepositStatus: async (chain: string, txHash: string) => {
+      seen.push([chain, txHash]);
+      return { found: true, claim: { state: "pending", stale: true } };
+    },
+    listDepositClaims: async () => { throw new Error("must not list"); },
+  } as unknown as SupraFxClient;
+  const tool = findTool("get_deposit_status", false);
+  assert.ok(tool);
+  assert.equal(tool.requiresSigner, false);
+  const out = (await tool.handler({ chain: " supra ", tx_hash: "0xabc" }, { client, signer: null })) as any;
+  assert.deepEqual(seen, [["supra", "0xabc"]]);
+  assert.equal(out.claim.stale, true);
+});
+
+test("get_deposit_status with no key lists the configured master's claims", async () => {
+  const seen: unknown[] = [];
+  const client = {
+    getDepositStatus: async () => { throw new Error("must not read one"); },
+    listDepositClaims: async (address: string, limit: number) => {
+      seen.push([address, limit]);
+      return { address, claims: [], counts: { pending: 0, stale: 0, credited: 0, rejected: 0, expired: 0 }, truncated: false };
+    },
+  } as unknown as SupraFxClient;
+  const tool = findTool("get_deposit_status", false);
+  assert.ok(tool);
+  await tool.handler({}, { client, signer: null, masterAddress: "0xmaster" });
+  await tool.handler({ address: "0xother", limit: 5 }, { client, signer: null, masterAddress: "0xmaster" });
+  assert.deepEqual(seen, [["0xmaster", 20], ["0xother", 5]]);
+});
+
+test("get_deposit_status refuses a half key rather than silently listing", async () => {
+  const tool = findTool("get_deposit_status", false);
+  assert.ok(tool);
+  const ctx = { client: {} as SupraFxClient, signer: null, masterAddress: "0xmaster" };
+  await assert.rejects(
+    tool.handler({ chain: "supra" }, ctx),
+    (e: unknown) => e instanceof ToolError && e.code === "INVALID_ARGS",
+  );
+  await assert.rejects(
+    tool.handler({ tx_hash: "0xabc" }, ctx),
+    (e: unknown) => e instanceof ToolError && e.code === "INVALID_ARGS",
+  );
+});
+
+test("get_deposit_status without a master and without a key says exactly what to set", async () => {
+  const tool = findTool("get_deposit_status", false);
+  assert.ok(tool);
+  await assert.rejects(
+    tool.handler({}, { client: {} as SupraFxClient, signer: null }),
+    (e: unknown) => e instanceof ToolError && e.code === "NO_MASTER_ADDRESS" && /SUPRAFX_MASTER_ADDRESS/.test(e.remedy),
+  );
+});

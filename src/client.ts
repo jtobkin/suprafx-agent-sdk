@@ -47,6 +47,40 @@ export interface PlatformBalance {
   total: number;
 }
 
+/** One deposit claim as `GET /api/platform/deposit` summarises it. */
+export interface DepositClaimSummary {
+  claim_id: string;
+  claimer_address: string;
+  chain: string;
+  tx_hash: string;
+  asset: string;
+  /** Decimal string, never a float. */
+  amount: string;
+  /** Raw venue status, e.g. `awaiting_council`, `rejected_wrong_vault`. */
+  status: string;
+  state: "pending" | "credited" | "rejected" | "expired";
+  created_at: string;
+  credited_at: string | null;
+  credited_batch_number: number | null;
+  rejection_reason: string | null;
+  age_seconds: number;
+  /** Pending for longer than the venue's fresh-wallet threshold. NOT a failure. */
+  stale: boolean;
+  next_step: string;
+}
+
+/** Single-claim lookup. `found:false` is a normal answer, not an error. */
+export type DepositStatusLookup =
+  | { found: true; claim: DepositClaimSummary }
+  | { found: false; chain: string; tx_hash: string; state: "unclaimed"; next_step: string };
+
+export interface DepositClaimList {
+  address: string;
+  claims: DepositClaimSummary[];
+  counts: { pending: number; stale: number; credited: number; rejected: number; expired: number };
+  truncated: boolean;
+}
+
 /** Public delegate-policy response. Additional venue fields are preserved. */
 export interface DelegatePolicy {
   active?: boolean;
@@ -267,6 +301,35 @@ export class SupraFxClient {
       "/api/platform/balances?address=" + encodeURIComponent(a),
     );
     return j.balances ?? [];
+  }
+
+  /**
+   * Status of one deposit claim, keyed on the chain and the L1 transaction
+   * hash. Answers "still crediting, or failed?" — see `state`, `stale` and
+   * `next_step`. An unknown transaction is `found:false`, not an error: a
+   * deposit made without recording a claim still credits through the
+   * validator bridge, it is just not visible here.
+   */
+  async getDepositStatus(chain: string, txHash: string): Promise<DepositStatusLookup> {
+    return await this.get<DepositStatusLookup>(
+      "/api/platform/deposit?chain=" + encodeURIComponent(chain) +
+        "&tx_hash=" + encodeURIComponent(txHash),
+    );
+  }
+
+  /** Every deposit claim recorded by `address` (a master account), newest first. */
+  async listDepositClaims(address: string, limit = 20): Promise<DepositClaimList> {
+    const a = address.startsWith("0x") ? address : "0x" + address;
+    const j = await this.get<Partial<DepositClaimList>>(
+      "/api/platform/deposit?address=" + encodeURIComponent(a) +
+        "&limit=" + encodeURIComponent(String(limit)),
+    );
+    return {
+      address: j.address ?? a,
+      claims: j.claims ?? [],
+      counts: j.counts ?? { pending: 0, stale: 0, credited: 0, rejected: 0, expired: 0 },
+      truncated: j.truncated ?? false,
+    };
   }
 
   /** On-chain policy currently associated with a delegate address. */
