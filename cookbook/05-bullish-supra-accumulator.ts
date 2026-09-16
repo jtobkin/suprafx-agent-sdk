@@ -48,6 +48,7 @@ import {
   toRateBFT,
 } from "../src/index.js";
 import { parsePair } from "../src/asset-registry.js";
+import { postAlert, installDeadman } from "./lib/alert.js";
 
 const BASE_URL = process.env.SUPRAFX_BASE_URL ?? "https://suprafx.ai";
 const QUOTE_ASSETS = (process.env.QUOTE_ASSETS ?? "USDC,USDT,ETH")
@@ -146,6 +147,7 @@ async function fetchSupraSellers(): Promise<any[]> {
 
 
 async function main() {
+  installDeadman("supra-accumulator"); // post bot_halted on crash/signal before dying
   console.log(
     DRY_RUN
       ? `[accumulator] DRY RUN — polling for SUPRA sellers, logging bids only, signing nothing. Set LIVE=1 to buy with real funds.`
@@ -183,6 +185,13 @@ async function main() {
       console.warn(`[accumulator] poll error (${consecFails}/${MAX_CONSEC_FAILS}): ${(e as Error).message}`);
       if (consecFails >= MAX_CONSEC_FAILS) {
         console.error(`[accumulator] ${consecFails} consecutive failures — exiting for a clean restart (pm2 will relaunch with fresh connections).`);
+        await postAlert({
+          source: "supra-accumulator",
+          kind: "bot_halted",
+          severity: "critical",
+          title: `accumulator halting after ${consecFails} consecutive poll failures`,
+          detail: `last error: ${(e as Error).message}. pm2 will relaunch; if this repeats the platform/API is likely unreachable.`,
+        });
         process.exit(1);
       }
     }
@@ -378,7 +387,14 @@ function randomBytes16(): Uint8Array {
   return out;
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(e);
+  await postAlert({
+    source: "supra-accumulator",
+    kind: "bot_halted",
+    severity: "critical",
+    title: `accumulator crashed: ${(e as Error).message}`,
+    detail: String((e as Error).stack ?? e).slice(0, 1000),
+  });
   process.exit(1);
 });

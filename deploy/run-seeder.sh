@@ -16,6 +16,11 @@ cd "$REPO_DIR"
 if [ -f "$HOME/.suprafx/seeder.env" ]; then
   set -a; . "$HOME/.suprafx/seeder.env"; set +a
 fi
+# Owner failure-alert secret (BOT_ALERT_SECRET), shared by both bots. Optional:
+# if unset, the bots run fine and simply don't post alerts.
+if [ -f "$HOME/.suprafx/alerts.env" ]; then
+  set -a; . "$HOME/.suprafx/alerts.env"; set +a
+fi
 
 if [ ! -f "$HOME/.suprafx/delegate.json" ]; then
   echo "missing ~/.suprafx/delegate.json — run cookbook/00-generate-delegate-key.ts first" >&2

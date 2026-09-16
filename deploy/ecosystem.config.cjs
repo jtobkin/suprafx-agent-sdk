@@ -31,5 +31,17 @@ module.exports = {
       restart_delay: 5000,
       time: true,
     },
+    {
+      // iAsset (iUSDC/iUSDT) standing-order desk (cookbook/07). Config in
+      // ~/.suprafx/iusd.env. Start just this one with:
+      //   npx pm2 start deploy/ecosystem.config.cjs --only supra-iusd
+      name: "supra-iusd",
+      script: "deploy/run-iusd.sh",
+      interpreter: "bash",
+      autorestart: true,
+      max_restarts: 20,
+      restart_delay: 5000,
+      time: true,
+    },
   ],
 };

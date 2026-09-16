@@ -67,6 +67,18 @@ export interface DepositClaimSummary {
   /** Pending for longer than the venue's fresh-wallet threshold. NOT a failure. */
   stale: boolean;
   next_step: string;
+  /**
+   * True when `state` came from the venue's ledger rather than the claim
+   * record — the money provably arrived while the record still says
+   * otherwise. `status` keeps the raw record value, so the two can disagree
+   * in one response; `state` is the one to act on.
+   */
+  reconciled_from_ledger?: boolean;
+  /**
+   * What the chain actually credited, when the venue matched a ledger entry.
+   * May differ from `amount`, which is what the depositor claimed to send.
+   */
+  credited_amount?: string | null;
 }
 
 /** Single-claim lookup. `found:false` is a normal answer, not an error. */
@@ -77,7 +89,15 @@ export type DepositStatusLookup =
 export interface DepositClaimList {
   address: string;
   claims: DepositClaimSummary[];
-  counts: { pending: number; stale: number; credited: number; rejected: number; expired: number };
+  counts: {
+    pending: number;
+    stale: number;
+    credited: number;
+    rejected: number;
+    expired: number;
+    /** How many of these were only known credited via the ledger. */
+    reconciled_from_ledger?: number;
+  };
   truncated: boolean;
 }
 
@@ -327,7 +347,8 @@ export class SupraFxClient {
     return {
       address: j.address ?? a,
       claims: j.claims ?? [],
-      counts: j.counts ?? { pending: 0, stale: 0, credited: 0, rejected: 0, expired: 0 },
+      counts: j.counts
+        ?? { pending: 0, stale: 0, credited: 0, rejected: 0, expired: 0, reconciled_from_ledger: 0 },
       truncated: j.truncated ?? false,
     };
   }

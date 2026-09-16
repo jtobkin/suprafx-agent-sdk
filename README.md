@@ -207,7 +207,7 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 | `get_my_identity` | Your delegate address and current seq |
 | `preflight({pair?})` | **Run this on connect.** Nine checks with the action that clears each: venue reachable, venue batch actually advancing (not just the L1), assets resolving to real ids, oracle freshness, custody, sequence drift, funding, stale own-RFQs still holding collateral |
 | `list_my_open_orders({address?})` | **Every order of yours still holding locked funds** — RFQs and quotes — each with the exact call that releases it. The answer to "where did my money go" |
-| `get_deposit_status({chain?, tx_hash?, address?})` | **Is my deposit still crediting, or did it fail?** One deposit by `chain` + `tx_hash`, or every claim of the master. `state` is `pending` \| `credited` \| `rejected` \| `expired`; `stale: true` on a pending claim is the fresh-wallet delay (15+ min), **not** a failure — wait and re-read, never re-send |
+| `get_deposit_status({chain?, tx_hash?, address?})` | **Is my deposit still crediting, or did it fail?** One deposit by `chain` + `tx_hash`, or every claim of the master. `state` is `pending` \| `credited` \| `rejected` \| `expired`; `stale: true` on a pending claim is the fresh-wallet delay (15+ min), **not** a failure — wait and re-read, never re-send. Act on `state`, not `status`: when `reconciled_from_ledger` is true the venue's ledger proved the money arrived and the claim record is simply stale |
 | `get_master_address` | The master address this server is configured with (the delegate has no balances of its own) |
 | `get_oracle_price({pair})` | Venue fair value **with the quote's age** and a `stale` flag. Never quote against a stale oracle |
 

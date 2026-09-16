@@ -33,6 +33,7 @@ import {
   toRateBFT,
 } from "../src/index.js";
 import { parsePair } from "../src/asset-registry.js";
+import { postAlert, installDeadman } from "./lib/alert.js";
 
 const BASE_URL = process.env.SUPRAFX_BASE_URL ?? "https://suprafx.ai";
 const MASTER = process.env.MASTER_ADDRESS!;
@@ -105,6 +106,12 @@ const signer = PRIV ? new DelegateSigner({ delegatePrivKeyHex: PRIV, client }) :
 
 // Our live RFQs, keyed by rfq id (uuid string).
 const mine = new Map<string, { rfqId: Uint8Array; side: Side; oracleAtPost: number }>();
+
+// rfq_never_landed tracking: every RFQ we submit ok:true, until we either see
+// it on the book (landed) or the grace window elapses without it ever showing
+// (dropped on-chain — a phantom post worth alerting on).
+const posted = new Map<string, { pair: string; postedAt: number; landed: boolean }>();
+const RFQ_LAND_TIMEOUT_MS = Number(process.env.RFQ_LAND_TIMEOUT_MS ?? 300_000); // 5 min
 
 async function fetchWithTimeout(url: string): Promise<Response> {
   const ctrl = new AbortController();
@@ -179,6 +186,7 @@ async function fetchOpenRfqs(): Promise<any[]> {
 }
 
 async function main() {
+  installDeadman("supra-seeder"); // post bot_halted on crash/signal before dying
   console.log(
     DRY_RUN
       ? `[seeder] DRY RUN — logging intended RFQ posts/cancels, signing nothing. Set LIVE=1 to post for real.`
@@ -214,6 +222,13 @@ async function main() {
       console.warn(`[seeder] poll error (${consecFails}/${MAX_CONSEC_FAILS}): ${(e as Error).message}`);
       if (consecFails >= MAX_CONSEC_FAILS) {
         console.error(`[seeder] ${consecFails} consecutive failures — exiting for a clean restart (pm2 will relaunch with fresh connections).`);
+        await postAlert({
+          source: "supra-seeder",
+          kind: "bot_halted",
+          severity: "critical",
+          title: `seeder halting after ${consecFails} consecutive poll failures`,
+          detail: `last error: ${(e as Error).message}. pm2 will relaunch; if this repeats the platform/API is likely unreachable.`,
+        });
         process.exit(1);
       }
     }
@@ -233,6 +248,33 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
   const open = await fetchOpenRfqs();
   const openIds = new Set<string>(open.map((r) => String(r.id)));
 
+  // rfq_never_landed: mark posts we can see on the book; alert on any that
+  // returned ok:true but never appeared after the grace window. submitRfq is
+  // ok from the mempool BEFORE the chain validates, so an earmark that exceeds
+  // the delegate cap (e.g. ETH > 0.002) or a short balance is silently dropped
+  // and the RFQ never rests. This catches exactly that.
+  for (const [id, p] of posted) if (openIds.has(id)) p.landed = true;
+  for (const [id, p] of [...posted]) {
+    if (openIds.has(id)) continue; // resting now (or just closed) — fine
+    if (p.landed) {
+      posted.delete(id); // landed earlier, now filled/expired/cancelled — normal
+      continue;
+    }
+    if (Date.now() - p.postedAt < RFQ_LAND_TIMEOUT_MS) continue; // still within grace
+    void postAlert({
+      source: "supra-seeder",
+      kind: "rfq_never_landed",
+      severity: "error",
+      title: `RFQ never landed on book: ${p.pair} (ok:true, no chain landing)`,
+      detail:
+        `id=${id} pair=${p.pair} — submitRfq returned ok but the RFQ never appeared on ` +
+        `the book after ${Math.round(RFQ_LAND_TIMEOUT_MS / 1000)}s. Usual cause: the earmark ` +
+        `exceeds the delegate per-trade cap (e.g. ETH > 0.002) or available balance is short.`,
+      context: { rfq_id: id, pair: p.pair, waited_s: Math.round((Date.now() - p.postedAt) / 1000) },
+    });
+    posted.delete(id);
+  }
+
   // Keep the sequence aligned (same self-heal as the accumulator).
   if (signer) {
     try {
@@ -243,7 +285,19 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
   }
 
   const nowMsCycle = Date.now();
-  const isOursRfq = (r: any) => String(r.taker_address ?? "").toLowerCase() === MASTER.toLowerCase();
+  // Ours AND made of tokens this seeder manages — other bots on the same
+  // master (e.g. the iUSD desk, cookbook/07) manage their own books.
+  const managesPair = (p: string): boolean => {
+    try {
+      const { base, quote } = parsePair(String(p ?? ""));
+      return base in CHAIN && quote in CHAIN;
+    } catch {
+      return false;
+    }
+  };
+  const isOursRfq = (r: any) =>
+    String(r.taker_address ?? "").toLowerCase() === MASTER.toLowerCase() &&
+    managesPair(r.pair);
   const cancelled = new Set<string>(); // ids we cancel this cycle (so counts/depth exclude them)
 
   // 1a. Age-cancel: cancel any of OUR RFQs older than AGE_CANCEL_MS. Book-based
@@ -377,6 +431,7 @@ async function pollOnce(dec: (s: string) => number): Promise<void> {
     });
     if (r.ok) {
       mine.set(rfqIdHex, { rfqId, side, oracleAtPost: rate });
+      posted.set(rfqIdHex, { pair: side.pair, postedAt: Date.now(), landed: false });
       activeCount++;
       console.log(`[seeder] ✓ posted ${line} [${rfqIdHex.slice(0, 8)}]`);
     } else {
@@ -417,7 +472,14 @@ function randomBytes16(): Uint8Array {
   return out;
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error(e);
+  await postAlert({
+    source: "supra-seeder",
+    kind: "bot_halted",
+    severity: "critical",
+    title: `seeder crashed: ${(e as Error).message}`,
+    detail: String((e as Error).stack ?? e).slice(0, 1000),
+  });
   process.exit(1);
 });

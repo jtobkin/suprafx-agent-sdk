@@ -298,7 +298,14 @@ const readTools: ToolDef[] = [
       "`rejected` or `expired` means the credit will not land on its own. " +
       "`found: false` means no claim was recorded for that transaction — the " +
       "deposit can still credit (the bridge does not need the claim); read " +
-      "`get_balances` instead.",
+      "`get_balances` instead. " +
+      "TRAP — the claim record is not the last word: the venue's credit can " +
+      "land BEFORE the record exists, leaving the record saying `pending` for " +
+      "ever on money that arrived (one real deposit read stuck for 57 days). " +
+      "The venue now checks its ledger, so `reconciled_from_ledger: true` " +
+      "means `state` came from the ledger and `status` is the stale record. " +
+      "Trust `state`, and never re-send a deposit on a `pending` record alone " +
+      "— check `get_balances` first.",
     inputSchema: {
       type: "object",
       properties: {

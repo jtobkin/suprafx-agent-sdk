@@ -17,6 +17,11 @@ cd "$REPO_DIR"
 if [ -f "$HOME/.suprafx/accumulator.env" ]; then
   set -a; . "$HOME/.suprafx/accumulator.env"; set +a
 fi
+# Owner failure-alert secret (BOT_ALERT_SECRET), shared by both bots. Optional:
+# if unset, the bots run fine and simply don't post alerts.
+if [ -f "$HOME/.suprafx/alerts.env" ]; then
+  set -a; . "$HOME/.suprafx/alerts.env"; set +a
+fi
 
 # Delegate key — read from the locked-down file, never echoed.
 if [ ! -f "$HOME/.suprafx/delegate.json" ]; then
