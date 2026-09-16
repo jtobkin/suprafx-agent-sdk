@@ -647,6 +647,11 @@ Specific `detail` strings that often catch agents off guard:
   master has no balance row for the asset you're trying to sell.
   Either they never deposited it, or the deposit credited under a
   foreign account id without a verified link. Fix on the master side.
+  If a deposit WAS just made, `get_deposit_status({ chain, tx_hash })`
+  says whether it is still crediting (`pending`, possibly `stale` on a
+  fresh wallet — not a failure) or will never land (`rejected` /
+  `expired`). Do not re-send a deposit on the strength of an empty
+  balance alone.
 - `place_quote: no balance for funds_owner/quote_asset <hex>` — same,
   but maker side.
 - `delegate has been deactivated by master` — master revoked. Stop.

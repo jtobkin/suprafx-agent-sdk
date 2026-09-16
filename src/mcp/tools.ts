@@ -286,6 +286,68 @@ const readTools: ToolDef[] = [
     },
   },
   {
+    name: "get_deposit_status",
+    description:
+      "Is a deposit still crediting, credited, or failed? Pass `chain` + " +
+      "`tx_hash` for one deposit, or nothing to list every claim of the " +
+      "configured master. Returns `state` — `pending` | `credited` | " +
+      "`rejected` | `expired` — plus `stale` and the one `next_step`. " +
+      "TRAP — fresh wallets: a brand-new wallet's first deposit can take 15+ " +
+      "minutes; that reads as `pending` with `stale: true`, which is NOT a " +
+      "failure. Wait and re-read; never re-send the deposit, never loop. Only " +
+      "`rejected` or `expired` means the credit will not land on its own. " +
+      "`found: false` means no claim was recorded for that transaction — the " +
+      "deposit can still credit (the bridge does not need the claim); read " +
+      "`get_balances` instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chain: {
+          type: "string",
+          description: "Chain the deposit was sent on, e.g. `supra`, `ethereum`. Required with `tx_hash`.",
+        },
+        tx_hash: {
+          type: "string",
+          description: "The L1 transaction hash of the deposit. Required with `chain`.",
+        },
+        address: {
+          type: "string",
+          description: "MASTER address whose claims to list. Omit to use the configured master.",
+        },
+        limit: {
+          type: "integer",
+          description: "List form only. Newest first; the venue caps this at 50.",
+        },
+      },
+    },
+    requiresSigner: false,
+    group: "read",
+    handler: async (args, ctx) => {
+      const chain = typeof args.chain === "string" ? args.chain.trim() : "";
+      const txHash = typeof args.tx_hash === "string" ? args.tx_hash.trim() : "";
+      if (chain && txHash) {
+        return await ctx.client.getDepositStatus(chain, txHash);
+      }
+      if (chain || txHash) {
+        throw new ToolError(
+          "INVALID_ARGS",
+          "get_deposit_status needs BOTH `chain` and `tx_hash` for a single deposit",
+          "pass both, or pass neither to list every claim of the configured master",
+        );
+      }
+      const address = (args.address ?? ctx.masterAddress) as string | null;
+      if (!address) {
+        throw new ToolError(
+          "NO_MASTER_ADDRESS",
+          "get_deposit_status needs a master address to list claims and none is configured",
+          "pass `chain` + `tx_hash`, set SUPRAFX_MASTER_ADDRESS, or pass `address` — see `get_master_address`",
+        );
+      }
+      const limit = Number.isInteger(args.limit) && args.limit > 0 ? Number(args.limit) : 20;
+      return await ctx.client.listDepositClaims(address, limit);
+    },
+  },
+  {
     name: "list_my_open_orders",
     description:
       "EVERY order of yours that is still holding locked funds — RFQs you " +
