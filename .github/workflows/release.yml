@@ -1,0 +1,101 @@
+# Publish suprafx-agent-sdk to npm with TRUSTED PUBLISHING (OIDC).
+#
+# WHY THIS EXISTS. Publishing 0.3.1 by hand cost the better part of a day. The
+# npm account's only second factor is a passkey, and the npm CLI cannot do
+# passkeys — so `npm publish` answers `EOTP` for ever. Every route was tried and
+# failed: recovery codes (npm does not accept them as a publish OTP), `npm login`
+# web auth, `--auth-type=web`, and switching the account to 2FA `auth-only`.
+# npm has removed the authenticator-app option, so no typed code can ever exist.
+# The release finally went out on a granular token with "Bypass 2FA", which was
+# then deleted — a one-off, not a practice.
+#
+# Trusted publishing removes the problem rather than working around it: GitHub
+# mints a short-lived OIDC token for THIS repo and THIS workflow, npm verifies
+# it, and nothing long-lived is stored anywhere. No token on a laptop, no token
+# in repo secrets, no one-time code.
+#
+# It could not be used for 0.3.1 because a trusted publisher can only be granted
+# on a package that already exists. The package exists now, so from 0.3.2 this
+# is the way.
+#
+# ── ONE-TIME SETUP ON npmjs.com (required before this can work) ──────────────
+#   npmjs.com → the suprafx-agent-sdk package → Settings → Trusted Publisher
+#     Publisher:        GitHub Actions
+#     Organization:     jtobkin
+#     Repository:       suprafx-agent-sdk
+#     Workflow file:    release.yml
+#     Environment:      (leave blank — this workflow declares none)
+#   The names must match exactly or npm rejects the OIDC token.
+#
+# ── HOW TO CUT A RELEASE ─────────────────────────────────────────────────────
+#   1. Bump "version" in package.json, commit to main.
+#   2. git tag v0.3.2 && git push origin v0.3.2
+#   Or run this workflow manually from the Actions tab.
+#   The tag is the trigger, but package.json is what npm publishes — step
+#   "version matches tag" below refuses a mismatch rather than shipping a
+#   surprise.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  # The whole point: lets GitHub mint the OIDC token npm exchanges for
+  # publish rights. Without it the publish fails with a missing-token error.
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    # Trusted publishing only accepts tokens from GitHub-HOSTED runners.
+    # A self-hosted runner cannot issue one npm will accept.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # v6 or later — earlier versions do not wire up trusted publishing.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+
+      # Node 22 ships npm 10.x; trusted publishing needs >= 11.5.1.
+      - name: Use an npm that understands trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - run: npm ci
+
+      # The same gate used by hand: 36 tests, and a build that must emit the
+      # paths package.json points at. `prepublishOnly` builds again on publish;
+      # building here means a broken build fails BEFORE anything is uploaded.
+      - run: npm run build
+      - run: npm test
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing $pkg"
+
+      # No NODE_AUTH_TOKEN, no secrets: the OIDC exchange is automatic.
+      - run: npm publish --access public
+
+      - name: Confirm it is on the registry
+        run: |
+          sleep 10
+          published="$(npm view suprafx-agent-sdk version)"
+          echo "registry now reports $published"
+          test "$published" = "$(node -p "require('./package.json').version")"
