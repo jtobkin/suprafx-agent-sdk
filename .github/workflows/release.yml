@@ -58,11 +58,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # v6 or later — earlier versions do not wire up trusted publishing.
+      # NO `registry-url` HERE, DELIBERATELY. It looks like the thing you want,
+      # and it is what broke the first release (run 35580609982, 2026-09-21).
+      # setup-node reacts to registry-url by writing an .npmrc containing
+      #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+      # and exporting the PLACEHOLDER value XXXXX-XXXXX-XXXXX-XXXXX for it.
+      # npm then sees a credential, publishes with it instead of attempting the
+      # OIDC exchange, and the registry answers:
+      #   404 Not Found - PUT .../suprafx-agent-sdk
+      # — which reads like "the package does not exist" but actually means "that
+      # token is not allowed to touch it". With no .npmrc and no NODE_AUTH_TOKEN,
+      # npm falls through to trusted publishing, which is the whole point.
+      # The default registry is already registry.npmjs.org, so nothing is lost.
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
           cache: "npm"
 
       # Node 22 ships npm 10.x; trusted publishing needs >= 11.5.1.
