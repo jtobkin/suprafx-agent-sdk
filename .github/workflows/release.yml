@@ -100,8 +100,21 @@ jobs:
           fi
           echo "publishing $pkg"
 
+      # TEMPORARY DIAGNOSTIC — remove once the first release is green.
+      - name: Can this job even mint an OIDC token?
+        run: |
+          echo "id-token URL present: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
+          echo "id-token request token present: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
+          echo "npm: $(npm --version)  registry: $(npm config get registry)"
+          echo "--- .npmrc files ---"
+          ls -la ~/.npmrc .npmrc 2>&1 || true
+          echo "NPM_CONFIG_USERCONFIG=${NPM_CONFIG_USERCONFIG:-unset}"
+
       # No NODE_AUTH_TOKEN, no secrets: the OIDC exchange is automatic.
-      - run: npm publish --access public
+      # verbose so a failed exchange says WHY — npm logs the attempt only above
+      # the default log level, which is how two failures looked like plain auth
+      # errors.
+      - run: npm publish --access public --loglevel verbose
 
       - name: Confirm it is on the registry
         run: |
