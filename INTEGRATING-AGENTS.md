@@ -133,6 +133,21 @@ up; the "quote" is what the taker receives.
 
 ---
 
+### Supported chains
+
+| Chain | `chain_id` in `list_assets` | Status | Assets |
+|---|---|---|---|
+| Ethereum | `ethereum` | Live | ETH, USDC, USDT |
+| Supra | `supra` | Live | SUPRA, iUSDC, iUSDT |
+| **Robinhood Chain** (EVM 4663) | `robinhood` | **Live** | USDG, plus tokenized stocks AAPL, NVDA, TSLA, AMZN, MSFT, META, SPY, QCOM |
+| **Arc** (EVM 5042) | `arc` | **Going live 27 Sep 2026** | USDC (listed as `USDC.arc`), EURC |
+| **Tempo** (EVM 4217) | `tempo` | **Going live 27 Sep 2026** | pathUSD, USDC.e, USDT0 |
+
+Arc and Tempo are stablecoins only. `list_assets` is the source of truth: an
+asset is tradeable once it appears there, and not before. Arc USDC is a
+separate asset from Ethereum USDC — pass `USDC.arc`, exactly as `list_assets`
+returns it.
+
 ## Gotchas (hard-won — read before you build)
 
 Non-obvious things that cost real debugging time:

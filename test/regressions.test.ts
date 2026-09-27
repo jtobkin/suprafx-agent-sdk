@@ -57,9 +57,59 @@ test("every asset shape the live venue returns is a registered, tradeable id", (
     ["supra", "SUPRA"],
     ["supra", "iUSDC"],
     ["supra", "iUSDT"],
+    ["robinhood", "USDG"],
+    ["robinhood", "AAPL"],
   ] as const) {
     assert.ok(registeredAssetId(chain, sym), `${chain}/${sym} must resolve to a registered id`);
   }
+});
+
+// ── Robinhood / Arc / Tempo: venue-listed assets the SDK could not trade ──
+//
+// On 2026-09-27 GET /api/assets listed nine `robinhood` assets, but the SDK's
+// registry held only Ethereum and Supra: `robinhood` canonicalised to itself,
+// every Robinhood asset fell through to the V1 hash, and submit_rfq on it was
+// rejected at the validator gate. Expected ids below were computed by the
+// VENUE's own derivation (suprafx `assetIdForChainTag`, main 281a680) — the
+// SDK must agree with it byte for byte or the chain sees "no balance".
+
+const VENUE_IDS: ReadonlyArray<[chain: string, symbol: string, idHex: string]> = [
+  ["robinhood", "USDG", "84f2da2b1609a29182ed95020b895b23efdd898b9a3f58da9ee6f7bb59e8ce18"],
+  ["robinhood", "AAPL", "eb163a6c925a3b4f117da05db1a3cde635683ed482c41060dcd7526150b228b2"],
+  ["robinhood", "NVDA", "1a57c1ba515648ffed0bfe74e996fee55b01a30e3922040660efa1e816456356"],
+  ["robinhood", "TSLA", "4f19286f9bd562c33094bda323ce43ff4e4497b89acee73e0e47e6e1a63d91ad"],
+  ["robinhood", "AMZN", "d9653e159a5a23650cd327df199ea625f2047a5733ca8ec1f657dc6a13022176"],
+  ["robinhood", "MSFT", "9c5f0615626d28d8fb72dd80af648428f19dc33946c7d8a65b29af5152409c60"],
+  ["robinhood", "META", "6c0bbad9501c45eb5e6c3b9824e4e6b498c1ba9548afebdaaf1694e12656306b"],
+  ["robinhood", "SPY", "6e31b2f20d2e40c0da878bdc2be3ff5f9e0fc7268ddb3ddb6bfe3bdfcc651218"],
+  ["robinhood", "QCOM", "e1a95d76ee84cab5c72531612546c5cedb35df3746b99b208b9165595566384e"],
+  ["arc", "USDC.arc", "3d83bf077db0af047740d4910846bdb7cff8944000c79b614b9c5dc51d03474f"],
+  ["arc", "EURC", "bbbe965d1480e05fcc255504418cfaf17f590055567ea9d6264a7ed496feef6d"],
+  ["tempo", "pathUSD", "19419f90cf96333ab6f9ce35d54e8240bb925ac85768bc1dbf7ed1d672711133"],
+  ["tempo", "USDC.e", "2deb6bd6e93aa71887fd311015c3c45200cf5be206a12b7477ae800b003bf35b"],
+  ["tempo", "USDT0", "fe71936e103e3cdcb231724fcfa27c9bd5f05f481aa4ad0e579b7835fe53ef80"],
+];
+
+test("Robinhood, Arc and Tempo assets derive to the venue's exact ids", () => {
+  for (const [chain, sym, want] of VENUE_IDS) {
+    const id = registeredAssetId(chain, sym);
+    assert.ok(id, `${chain}/${sym} must resolve to a registered id`);
+    assert.equal(hex(id), want, `${chain}/${sym}`);
+    // The council id and the short tag must name the same asset.
+    assert.equal(hex(deriveAssetId(`${chain}-mainnet`, sym)), want, `${chain}-mainnet/${sym}`);
+  }
+});
+
+test("the short chain tags fold onto the council chain ids", () => {
+  assert.equal(canonicalChain("robinhood"), "robinhood-mainnet");
+  assert.equal(canonicalChain("Arc"), "arc-mainnet");
+  assert.equal(canonicalChain("tempo"), "tempo-mainnet");
+});
+
+test("Arc USDC is its own asset, never Ethereum USDC", () => {
+  // Keyed `USDC.arc` so its balance cannot merge with Ethereum USDC.
+  assert.equal(registeredAssetId("arc", "USDC"), null);
+  assert.notEqual(hex(registeredAssetId("arc", "USDC.arc")!), hex(registeredAssetId("ethereum", "USDC")!));
 });
 
 // ── P0: the orderbook was silently always empty ────────────────
