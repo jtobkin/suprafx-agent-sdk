@@ -252,9 +252,8 @@ const TOKEN_REGISTRY: Map<string, TokenSpec> = new Map([
 // folds the short tags ("robinhood", "arc", "tempo") onto it.
 //
 // Robinhood Chain (4663) — live since 2026-09. Arc (5042) and Tempo
-// (4217) are stablecoins only and activate at council batch
-// 10,805,000 (2026-09-27); until the council registers them the venue
-// does not list them and `list_assets` will not return them.
+// (4217) are stablecoins only, live from council batch 10,805,000
+// (2026-09-27).
 // ────────────────────────────────────────────────────────────────────
 const REGISTRY_EVM_ASSETS: ReadonlyArray<[chainId: string, symbol: string, tokenHex: string]> = [
   ["robinhood-mainnet", "USDG", "0x5fc5360d0400a0fd4f2af552add042d716f1d168"],

@@ -43,8 +43,8 @@ enforced on chain. Read the code — it's small on purpose.
 | Ethereum | `ethereum` | Live | ETH, USDC, USDT |
 | Supra | `supra` | Live | SUPRA, iUSDC, iUSDT |
 | **Robinhood Chain** (EVM 4663) | `robinhood` | **Live** | USDG, plus tokenized stocks AAPL, NVDA, TSLA, AMZN, MSFT, META, SPY, QCOM |
-| **Arc** (EVM 5042) | `arc` | **Going live 27 Sep 2026** | USDC (listed as `USDC.arc`), EURC |
-| **Tempo** (EVM 4217) | `tempo` | **Going live 27 Sep 2026** | pathUSD, USDC.e, USDT0 |
+| **Arc** (EVM 5042) | `arc` | **Live** | USDC (listed as `USDC.arc`), EURC |
+| **Tempo** (EVM 4217) | `tempo` | **Live** | pathUSD, USDC.e, USDT0 |
 
 Arc and Tempo are stablecoins only. `list_assets` is the source of truth: an
 asset is tradeable once it appears there, and not before. Arc USDC is a
