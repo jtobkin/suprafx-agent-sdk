@@ -25,6 +25,9 @@
 #     Repository:       suprafx-agent-sdk
 #     Workflow file:    release.yml
 #     Environment:      (leave blank — this workflow declares none)
+#     Allowed actions:  TICK "Allow npm publish". It is unticked by default,
+#                       which allows only `npm stage publish` — and this
+#                       workflow runs a plain `npm publish`.
 #   The names must match exactly or npm rejects the OIDC token.
 #
 # ── HOW TO CUT A RELEASE ─────────────────────────────────────────────────────
@@ -100,25 +103,25 @@ jobs:
           fi
           echo "publishing $pkg"
 
-      # TEMPORARY DIAGNOSTIC — remove once the first release is green.
-      - name: Can this job even mint an OIDC token?
-        run: |
-          echo "id-token URL present: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}${ACTIONS_ID_TOKEN_REQUEST_URL:-NO}"
-          echo "id-token request token present: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-NO}"
-          echo "npm: $(npm --version)  registry: $(npm config get registry)"
-          echo "--- .npmrc files ---"
-          ls -la ~/.npmrc .npmrc 2>&1 || true
-          echo "NPM_CONFIG_USERCONFIG=${NPM_CONFIG_USERCONFIG:-unset}"
-
       # No NODE_AUTH_TOKEN, no secrets: the OIDC exchange is automatic.
       # verbose so a failed exchange says WHY — npm logs the attempt only above
       # the default log level, which is how two failures looked like plain auth
       # errors.
       - run: npm publish --access public --loglevel verbose
 
+      # npm answers the publish with "202 — being processed and may take a few
+      # minutes to become available". Run 36301038159 (0.3.2, 2026-09-27) went red
+      # here on a 10 s wait although the publish had succeeded; the version
+      # appeared about 4 minutes later. Poll for up to 10 minutes instead.
       - name: Confirm it is on the registry
         run: |
-          sleep 10
-          published="$(npm view suprafx-agent-sdk version)"
-          echo "registry now reports $published"
-          test "$published" = "$(node -p "require('./package.json').version")"
+          pkg="$(node -p "require('./package.json').version")"
+          for i in $(seq 1 40); do
+            if npm view "suprafx-agent-sdk@$pkg" version >/dev/null 2>&1; then
+              echo "registry now lists $pkg (after ~$(( (i - 1) * 15 )) s)"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::$pkg still not on the registry after 10 minutes"
+          exit 1
