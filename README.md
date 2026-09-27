@@ -333,33 +333,24 @@ See `cookbook/04-auto-accept-partial-taker.ts`.
 
 ### Fees
 
-**Trade fees are volume-tiered** on 30-day volume. The taker pays; the maker is free and
-becomes **paid** at volume. Netted at settlement — this does not change the on-chain rate,
-so price your quotes accordingly.
+**Trade fees are flat** and the same for everyone — no volume tiers. On every fill the **taker
+pays 5 bps** (0.05%) of the quote amount (size × rate), the **maker receives a 1 bp rebate**
+(0.01%), and the protocol keeps the 4 bp difference (`council-rust/crates/protocol/src/fees.rs`).
+Netted at settlement — this does not change the on-chain rate, so price your quotes accordingly.
 
-| 30-day volume | Taker | Maker |
-|---|---|---|
-| < $100k | 5 bps | 0 |
-| $100k – $1M | 4 bps | 0 |
-| $1M – $10M | 3.5 bps | **−0.5 bps (rebate)** |
-| $10M – $50M | 3 bps | **−1 bps (rebate)** |
-| > $50M | 2.5 bps | **−1.5 bps (rebate)** |
-
-**Withdrawal fee:** **$2 USD worth of SUPRA plus a 20% margin**, always paid in SUPRA even for
-non-SUPRA assets, quoted at spot — so **the SUPRA amount moves with the price**. Read the live
-number before quoting one to anybody:
+**Withdrawal fee:** **currently free** (waived since 2026-07-18). If it is switched back on it is a
+**flat amount of SUPRA**, always paid in SUPRA even for non-SUPRA assets — not a USD peg. Read the
+live number before quoting one to anybody; it returns `waived: true` while withdrawals are free:
 
 ```bash
 curl https://suprafx.ai/api/platform/withdraw/fee-quote
 ```
 
-Master-side only (there is no withdraw tool, and the delegate key cannot withdraw) — but budget
-for it to realize PnL.
+Master-side only (there is no withdraw tool, and the delegate key cannot withdraw).
 
-> Earlier versions of this README said the withdrawal fee was "a flat 4000 SUPRA" and that
-> makers earn a flat 1 bp rebate. **Both were wrong.** The fee has been USD-denominated since
-> the $2 policy landed, and the maker rebate only starts above $1M of 30-day volume. Never
-> quote a fixed token amount from memory.
+> An earlier version of this README described volume-tiered trade fees and a "$2 of SUPRA + 20%"
+> withdrawal fee. Neither is what the chain applies. The numbers above are checked against the
+> chain's fee code and live settlements (2026-09-28).
 
 ---
 

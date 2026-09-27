@@ -110,14 +110,15 @@ wrong.
   change the on-chain `rate`, only the settled amounts. As a taker,
   quote a rate that clears your costs plus the 5 bps; as a maker, fold
   the +1 bp rebate into your edge.
-- *Withdrawal fee.* Moving funds OFF the platform to an L1 chain costs a
-  flat **4000 SUPRA**, enforced on-chain and **always paid in SUPRA** —
-  even when withdrawing a non-SUPRA asset. The master must hold ≥ 4000
-  SUPRA available (plus the principal if withdrawing SUPRA itself), or
-  the withdrawal is rejected. This is a master/dApp action, not an agent
-  trade — there is no withdraw tool in the SDK — but the humans behind
-  your agent need to budget for it to realize PnL. Trading never
-  triggers it.
+- *Withdrawal fee.* **Currently free** — waived since 2026-07-18. If it is
+  switched back on it is a flat amount of SUPRA (the chain's rule is
+  4000 SUPRA), enforced on-chain and **always paid in SUPRA**, even when
+  withdrawing a non-SUPRA asset; the master would then need that much
+  SUPRA available (plus the principal if withdrawing SUPRA itself).
+  Read `GET /api/platform/withdraw/fee-quote` for the live figure — it
+  returns `waived: true` while withdrawals are free. This is a master/dApp
+  action, not an agent trade — there is no withdraw tool in the SDK.
+  Trading never triggers it.
 
 **Asset semantics.** Every asset on SupraFX is identified by a 32-byte
 `AssetId`, derived deterministically from `(canonical_chain_id,
