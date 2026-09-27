@@ -245,6 +245,43 @@ const TOKEN_REGISTRY: Map<string, TokenSpec> = new Map([
   ],
 ]);
 
+// ────────────────────────────────────────────────────────────────────
+// Registry EVM chains added after genesis — mirrors the venue's
+// `lib/council/asset-catalog.ts` (suprafx), every address read back
+// from the live chain. Keyed by the council chain id; `canonicalChain`
+// folds the short tags ("robinhood", "arc", "tempo") onto it.
+//
+// Robinhood Chain (4663) — live since 2026-09. Arc (5042) and Tempo
+// (4217) are stablecoins only and activate at council batch
+// 10,805,000 (2026-09-27); until the council registers them the venue
+// does not list them and `list_assets` will not return them.
+// ────────────────────────────────────────────────────────────────────
+const REGISTRY_EVM_ASSETS: ReadonlyArray<[chainId: string, symbol: string, tokenHex: string]> = [
+  ["robinhood-mainnet", "USDG", "0x5fc5360d0400a0fd4f2af552add042d716f1d168"],
+  ["robinhood-mainnet", "AAPL", "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9"],
+  ["robinhood-mainnet", "NVDA", "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec"],
+  ["robinhood-mainnet", "TSLA", "0x322f0929c4625ed5bad873c95208d54e1c003b2d"],
+  ["robinhood-mainnet", "AMZN", "0x12f190a9f9d7d37a250758b26824b97ce941bf54"],
+  ["robinhood-mainnet", "MSFT", "0xe93237c50d904957cf27e7b1133b510c669c2e74"],
+  ["robinhood-mainnet", "META", "0xc0d6457c16cc70d6790dd43521c899c87ce02f35"],
+  ["robinhood-mainnet", "SPY", "0x117cc2133c37b721f49de2a7a74833232b3b4c0c"],
+  ["robinhood-mainnet", "QCOM", "0x0f17206447090e464c277571124dd2688e48aea9"],
+  // Arc USDC is catalogued as `USDC.arc` so its balance never merges
+  // with Ethereum USDC (the ledger keys balances by symbol alone).
+  ["arc-mainnet", "USDC.arc", "0x3600000000000000000000000000000000000000"],
+  ["arc-mainnet", "EURC", "0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1"],
+  ["tempo-mainnet", "pathUSD", "0x20c0000000000000000000000000000000000000"],
+  ["tempo-mainnet", "USDC.e", "0x20c000000000000000000000b9537d11c60e8b50"],
+  ["tempo-mainnet", "USDT0", "0x20c00000000000000000000014f22ca97301eb73"],
+];
+
+for (const [chainId, symbol, tokenHex] of REGISTRY_EVM_ASSETS) {
+  TOKEN_REGISTRY.set(`${chainId}/${symbol.toUpperCase()}`, {
+    chainId,
+    tokenBytes: hexAddrToBytes(tokenHex),
+  });
+}
+
 function hexAddrToBytes(hex: string): Uint8Array {
   const s = hex.startsWith("0x") || hex.startsWith("0X") ? hex.slice(2) : hex;
   if (s.length !== 40) throw new Error(`hexAddrToBytes: ${hex} not 20 bytes`);
@@ -320,6 +357,15 @@ export function canonicalChain(chain: string): string {
       return "eth-sepolia";
     case "supra-testnet":
       return "supra-testnet";
+    case "robinhood":
+    case "robinhood-mainnet":
+      return "robinhood-mainnet";
+    case "arc":
+    case "arc-mainnet":
+      return "arc-mainnet";
+    case "tempo":
+    case "tempo-mainnet":
+      return "tempo-mainnet";
     default:
       return chain.trim().toLowerCase();
   }
