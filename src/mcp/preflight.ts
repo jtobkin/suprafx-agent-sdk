@@ -10,6 +10,11 @@
 import type { SupraFxClient } from "../client.js";
 import type { DelegateSigner } from "../signer.js";
 import { registeredAssetId, canonicalChain } from "../derive-ids.js";
+import {
+  MIN_EXPIRY_LEAD_BATCHES,
+  MIN_SAFE_EXPIRY_BATCHES,
+  WEBSITE_EXPIRY_BUFFER_BATCHES,
+} from "../expiry.js";
 
 /** A quote older than this must not be traded against. */
 export const ORACLE_STALE_MS = 120_000;
@@ -96,6 +101,30 @@ export async function runPreflight(opts: PreflightOptions): Promise<PreflightRes
     } catch (e) {
       push({ name: "venue_advancing", status: "warn", detail: msg(e) });
     }
+  }
+
+  // ── 2b. Has batch-native order expiry activated? ────────────────
+  try {
+    const [params, batch] = await Promise.all([
+      client.getConsensusParams(),
+      client.getCurrentBatch(),
+    ]);
+    const activation = BigInt(params.fleet_must_match.lock_release_activation_batch);
+    const live = activation !== BigInt("18446744073709551615") && BigInt(batch + 1) >= activation;
+    push({
+      name: "on_chain_expiry",
+      status: "ok",
+      detail: live
+        ? `live since batch ${activation}; orders use batch expiry; signing requires at least ${MIN_SAFE_EXPIRY_BATCHES} batches (${MIN_EXPIRY_LEAD_BATCHES} chain lead + ${WEBSITE_EXPIRY_BUFFER_BATCHES} commit buffer)`
+        : `not live; activation batch ${activation}, current batch ${batch}; when live, signing requires at least ${MIN_SAFE_EXPIRY_BATCHES} batches`,
+    });
+  } catch (e) {
+    push({
+      name: "on_chain_expiry",
+      status: "warn",
+      detail: msg(e),
+      action: "Re-read consensus-params before submitting an order.",
+    });
   }
 
   // ── 3. Do the venue's own assets derive to REGISTERED ids? ───────
@@ -279,34 +308,20 @@ export async function runPreflight(opts: PreflightOptions): Promise<PreflightRes
     }
   }
 
-  // ── 8. Stale own RFQs still holding collateral ───────────────────
+  // ── 8. Orders that still legitimately hold collateral ───────────
   if (masterAddress) {
     try {
-      const stale: string[] = [];
-      for (const status of ["open", "expired"]) {
-        const rows = await client.getOrderbook({ status, limit: 200 });
-        for (const r of rows) {
-          if (r.taker_address?.toLowerCase() !== masterAddress.toLowerCase()) continue;
-          const expired =
-            status === "expired" ||
-            (r.expires_at ? Date.parse(r.expires_at) < Date.now() : false);
-          if (expired) stale.push(`${r.id} (${r.pair}, ${status})`);
-        }
-      }
+      const orders = await client.listMyOpenOrders(masterAddress);
+      const count = orders.rfqs.length + orders.quotes.length;
       push({
-        name: "stale_own_rfqs",
-        status: stale.length === 0 ? "ok" : "warn",
-        detail:
-          stale.length === 0
-            ? "no expired RFQs of yours are still listed"
-            : `${stale.length} expired RFQ(s) still listed: ${stale.join(", ")}`,
-        action:
-          stale.length === 0
-            ? undefined
-            : "Each may still hold collateral. `cancel_rfq` them, then re-read get_balances.",
+        name: "open_order_locks",
+        status: "ok",
+        detail: count === 0
+          ? "no open RFQs or quotes are holding collateral"
+          : `${count} open order(s) currently hold collateral; expired/unfillable orders are closed`,
       });
     } catch (e) {
-      push({ name: "stale_own_rfqs", status: "warn", detail: msg(e) });
+      push({ name: "open_order_locks", status: "warn", detail: msg(e) });
     }
   }
 

@@ -124,6 +124,30 @@ export interface OrderbookRfq {
   min_fill_size: number;
   expires_at: string;
   created_at: string;
+  expires_at_batch?: string | number | null;
+  council_batch_number?: string | number | null;
+}
+
+export interface ConsensusParams {
+  fleet_must_match: {
+    lock_release_activation_batch: string | number;
+    default_ttl_batches: number;
+    min_expiry_lead_batches: number;
+    max_lifetime_batches: number;
+    max_expiry_slots_per_batch: number;
+    [key: string]: string | number;
+  };
+  node_local?: Record<string, string | number>;
+}
+
+export interface MyOpenOrders {
+  address: string;
+  rfqs: Array<OrderbookRfq & { status: string }>;
+  quotes: Array<Record<string, unknown> & { status: string }>;
+  lockedOrders: Array<{ asset: string; amount: string }>;
+  lockedRfqs: Array<{ asset: string; amount: string }>;
+  chainChecked: boolean;
+  switchOnDate?: string | null;
 }
 
 export interface SubmitResult {
@@ -132,6 +156,8 @@ export interface SubmitResult {
   event_hash_hex?: string;
   code?: string;
   detail?: string;
+  /** Plain-English refusal reason returned by the website's 409 gate. */
+  reason?: string;
   per_validator?: unknown[];
 }
 
@@ -224,6 +250,10 @@ export class SupraFxClient {
   private readonly timeoutMs: number;
   private cachedChainInfo: ChainInfo | null = null;
   private cachedClockOffset: { offsetMs: number; expiresAtMs: number } | null = null;
+  private cachedConsensusParams: {
+    value: ConsensusParams;
+    expiresAtMs: number;
+  } | null = null;
 
   constructor(opts: SupraFxClientOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, "");
@@ -291,6 +321,31 @@ export class SupraFxClient {
       "/api/council/current-batch",
     );
     return j.current_batch;
+  }
+
+  /** Public chain expiry constants reported by the rolled venue fleet. */
+  async getConsensusParams(): Promise<ConsensusParams> {
+    const now = Date.now();
+    if (this.cachedConsensusParams && now < this.cachedConsensusParams.expiresAtMs) {
+      return this.cachedConsensusParams.value;
+    }
+    const value = await this.get<ConsensusParams>("/api/council/consensus-params");
+    this.cachedConsensusParams = { value, expiresAtMs: now + 60_000 };
+    return value;
+  }
+
+  /** Orders that can still hold funds. Expired/unfillable rows are closed. */
+  async listMyOpenOrders(address: string): Promise<MyOpenOrders> {
+    const a = address.startsWith("0x") ? address : "0x" + address;
+    const result = await this.get<MyOpenOrders>(
+      "/api/council/my-open-orders?address=" + encodeURIComponent(a),
+    );
+    return {
+      ...result,
+      rfqs: (result.rfqs ?? []).filter((row) =>
+        row.status !== "expired" && row.status !== "unfillable"),
+      quotes: (result.quotes ?? []).filter((row) => row.status !== "expired"),
+    };
   }
 
   /**
@@ -388,6 +443,16 @@ export class SupraFxClient {
       rfqs?: OrderbookRfq[];
     }>("/api/suprafx/rfqs?" + qs.toString());
     return j.data ?? j.rfqs ?? [];
+  }
+
+  /** Exact public RFQ lookup. Use this for parent-dependent signing checks;
+   * paginated orderbook scans can omit a valid order. */
+  async getRfqById(id: string): Promise<OrderbookRfq | null> {
+    const j = await this.get<{
+      rfq?: OrderbookRfq;
+      data?: OrderbookRfq[];
+    }>("/api/suprafx/rfqs?id=" + encodeURIComponent(id));
+    return j.rfq ?? j.data?.[0] ?? null;
   }
 
   /**

@@ -225,7 +225,7 @@ See [`cookbook/`](./cookbook/) for full runnable examples.
 | `get_balances({address?})` | A master's available + locked balances per asset. `address` optional once a master is configured. **The tie-breaker read whenever a write reports `unknown`** |
 | `get_orderbook({pair?, status?, limit?})` | Open RFQs (or filter by status), each with the quotes placed on it |
 | `get_my_identity` | Your delegate address and current seq |
-| `preflight({pair?})` | **Run this on connect.** Nine checks with the action that clears each: venue reachable, venue batch actually advancing (not just the L1), assets resolving to real ids, oracle freshness, custody, sequence drift, funding, stale own-RFQs still holding collateral |
+| `preflight({pair?})` | **Run this on connect.** Checks venue reachability/advancement, live expiry activation, asset ids, oracle freshness, custody, sequence drift, funding, and open-order locks |
 | `list_my_open_orders({address?})` | **Every order of yours still holding locked funds** — RFQs and quotes — each with the exact call that releases it. The answer to "where did my money go" |
 | `get_deposit_status({chain?, tx_hash?, address?})` | **Is my deposit still crediting, or did it fail?** One deposit by `chain` + `tx_hash`, or every claim of the master. `state` is `pending` \| `credited` \| `rejected` \| `expired`; `stale: true` on a pending claim is the fresh-wallet delay (15+ min), **not** a failure — wait and re-read, never re-send. Act on `state`, not `status`: when `reconciled_from_ledger` is true the venue's ledger proved the money arrived and the claim record is simply stale |
 | `get_master_address` | The master address this server is configured with (the delegate has no balances of its own) |
@@ -461,3 +461,20 @@ batch/sec.
 
 Open an issue on the repo, or reach out via the Discord linked from
 `suprafx.ai`.
+### Batch expiry and automatic refunds
+
+`submit_rfq` and `place_quote` use `expires_in_batches` (minimum `12`, default
+`545`, maximum `200000`). The signer reads the activation parameter and current
+batch, emits V1 before the switch (and whenever activation is unknown), then V2
+when the next batch reaches activation. Consensus params are cached for at most
+60 seconds. The minimum combines the chain's 2-batch lead with the website's
+10-batch commit buffer. A quote can never outlive its parent
+RFQ. Batch expiry is consensus state, not a local clock: losing quotes are
+released automatically, and `Expired` / `Unfillable` orders no longer hold
+funds. At the activation switch, older orders are frozen and then closed and
+refunded automatically. `get_setup_status` and `preflight` read
+`consensus-params` and report whether this behavior is live.
+
+Trading and withdrawal fees remain the fees documented above; expiry does not
+add a fee. Publishing this version is an owner decision after audit—the version
+bump in source is not a release.

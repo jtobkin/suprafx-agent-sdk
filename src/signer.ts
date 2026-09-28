@@ -32,6 +32,12 @@ import {
   encodeEnvelopeBcs,
 } from "./sign-event.js";
 import { SupraFxClient, type SubmitResult } from "./client.js";
+import {
+  DEFAULT_EXPIRY_BATCHES,
+  MAX_EXPIRY_BATCHES,
+  MIN_SAFE_EXPIRY_BATCHES,
+  readLockReleaseState,
+} from "./expiry.js";
 
 /** Codes that mean the chain accepted the envelope at mempool but
  *  rejected it at apply-time. The seq slot is consumed either way. */
@@ -56,7 +62,9 @@ const CHAIN_SAW_IT_CODES: ReadonlySet<string> = new Set([
  */
 const CONSUMES_SEQ: ReadonlySet<UserEvent["kind"]> = new Set([
   "SubmitRfq",
+  "SubmitRfqV2",
   "PlaceQuote",
+  "PlaceQuoteV2",
   "AcceptQuote",
 ]);
 
@@ -168,31 +176,114 @@ export class DelegateSigner {
   // ─── Convenience methods that build the event + send ──────────
 
   async submitRfq(payload: Omit<
-    Extract<UserEvent, { kind: "SubmitRfq" }>["payload"],
-    "user_sequence_number" | "user"
-  >): Promise<SubmitResult> {
+    Extract<UserEvent, { kind: "SubmitRfqV2" }>["payload"],
+    "user_sequence_number" | "user" | "expires_at_batch"
+  > & { expires_in_batches?: number }): Promise<SubmitResult> {
+    const { expires_in_batches = DEFAULT_EXPIRY_BATCHES, ...eventPayload } = payload;
+    assertExpiryLifetime(expires_in_batches);
+    const lockRelease = await readLockReleaseState(this.client);
+    if (!lockRelease.live || lockRelease.targetBatch === null) {
+      return await this.sendEnvelope({
+        kind: "SubmitRfq",
+        payload: {
+          user: this.address,
+          ...eventPayload,
+          user_sequence_number: this.nextSeq,
+        } as Extract<UserEvent, { kind: "SubmitRfq" }>["payload"],
+      });
+    }
+    const targetBatch = lockRelease.targetBatch;
     return await this.sendEnvelope({
-      kind: "SubmitRfq",
+      kind: "SubmitRfqV2",
       payload: {
         user: this.address,
-        ...payload,
+        ...eventPayload,
         user_sequence_number: this.nextSeq,
-      } as Extract<UserEvent, { kind: "SubmitRfq" }>["payload"],
+        expires_at_batch: targetBatch + BigInt(expires_in_batches),
+      } as Extract<UserEvent, { kind: "SubmitRfqV2" }>["payload"],
     });
   }
 
   async placeQuote(payload: Omit<
-    Extract<UserEvent, { kind: "PlaceQuote" }>["payload"],
-    "user_sequence_number" | "maker"
-  >): Promise<SubmitResult> {
+    Extract<UserEvent, { kind: "PlaceQuoteV2" }>["payload"],
+    "user_sequence_number" | "maker" | "expires_at_batch"
+  > & { expires_in_batches?: number; parent_expires_at_batch?: bigint | number | string }): Promise<SubmitResult> {
+    const {
+      expires_in_batches = DEFAULT_EXPIRY_BATCHES,
+      parent_expires_at_batch,
+      ...eventPayload
+    } = payload;
+    assertExpiryLifetime(expires_in_batches);
+    const lockRelease = await readLockReleaseState(this.client);
+    if (!lockRelease.live || lockRelease.targetBatch === null) {
+      return await this.sendEnvelope({
+        kind: "PlaceQuote",
+        payload: {
+          maker: this.address,
+          ...eventPayload,
+          user_sequence_number: this.nextSeq,
+        } as Extract<UserEvent, { kind: "PlaceQuote" }>["payload"],
+      });
+    }
+    const targetBatch = lockRelease.targetBatch;
+    const parentExpiry = parent_expires_at_batch == null
+      ? await this.fetchParentExpiry(
+          eventPayload.rfq_id,
+          lockRelease.activationBatch!,
+        )
+      : BigInt(parent_expires_at_batch);
+    const expiresAtBatch = minBigInt(targetBatch + BigInt(expires_in_batches), parentExpiry);
+    if (expiresAtBatch < targetBatch + BigInt(MIN_SAFE_EXPIRY_BATCHES)) {
+      throw new Error("The parent RFQ expires too soon to place a quote safely.");
+    }
     return await this.sendEnvelope({
-      kind: "PlaceQuote",
+      kind: "PlaceQuoteV2",
       payload: {
         maker: this.address,
-        ...payload,
+        ...eventPayload,
         user_sequence_number: this.nextSeq,
-      } as Extract<UserEvent, { kind: "PlaceQuote" }>["payload"],
+        expires_at_batch: expiresAtBatch,
+      } as Extract<UserEvent, { kind: "PlaceQuoteV2" }>["payload"],
     });
+  }
+
+  /** Fetch expiry only after activation. Pre-activation quotes stay V1 and
+   * never mistake absent expiry metadata for a frozen parent. */
+  private async fetchParentExpiry(
+    rfqId: Uint8Array,
+    activationBatch: bigint,
+  ): Promise<bigint> {
+    let parent: Awaited<ReturnType<SupraFxClient["getRfqById"]>>;
+    try {
+      parent = await this.client.getRfqById(bytes16ToUuid(rfqId));
+    } catch {
+      throw parentExpiryUnavailable();
+    }
+    if (!parent) throw parentExpiryUnavailable();
+    if (parent.status.toLowerCase() !== "open") {
+      throw new Error("This order is no longer open.");
+    }
+    if (parent.expires_at_batch != null) {
+      try {
+        return BigInt(parent.expires_at_batch);
+      } catch {
+        throw parentExpiryUnavailable();
+      }
+    }
+    let parentBatch: bigint | null = null;
+    if (parent.council_batch_number != null) {
+      try {
+        parentBatch = BigInt(parent.council_batch_number);
+      } catch {
+        throw parentExpiryUnavailable();
+      }
+    }
+    if (parentBatch === null || parentBatch < activationBatch) {
+      throw new Error(
+        "This older order is frozen for the expiry upgrade and cannot receive new quotes.",
+      );
+    }
+    throw parentExpiryUnavailable();
   }
 
   /** CancelRfq has no `user_sequence_number` — rfq_id uniqueness is
@@ -250,8 +341,10 @@ function routeForEvent(kind: UserEvent["kind"]): {
 } {
   switch (kind) {
     case "SubmitRfq":
+    case "SubmitRfqV2":
       return { endpoint: "submit-rfq", bodyField: "submit_rfq_envelope_bcs_hex" };
     case "PlaceQuote":
+    case "PlaceQuoteV2":
       return { endpoint: "place-quote", bodyField: "place_quote_envelope_bcs_hex" };
     case "AcceptQuote":
       return { endpoint: "accept-quote", bodyField: "accept_quote_envelope_bcs_hex" };
@@ -262,6 +355,28 @@ function routeForEvent(kind: UserEvent["kind"]): {
     default:
       throw new Error(`routeForEvent: no endpoint for event kind ${kind}`);
   }
+}
+
+function assertExpiryLifetime(value: number): void {
+  if (
+    !Number.isInteger(value) ||
+    value < MIN_SAFE_EXPIRY_BATCHES ||
+    value > MAX_EXPIRY_BATCHES
+  ) {
+    throw new Error(
+      `expires_in_batches must be a whole number between ${MIN_SAFE_EXPIRY_BATCHES} and ${MAX_EXPIRY_BATCHES}`,
+    );
+  }
+}
+
+function minBigInt(a: bigint, b: bigint): bigint {
+  return a < b ? a : b;
+}
+
+function parentExpiryUnavailable(): Error {
+  return new Error(
+    "This order's on-chain expiry is unavailable. Refresh the orderbook and try again.",
+  );
 }
 
 function stripHex(s: string): string {
@@ -280,4 +395,10 @@ function hexToBytes(s: string): Uint8Array {
 
 function bytesToHex(b: Uint8Array): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function bytes16ToUuid(bytes: Uint8Array): string {
+  if (bytes.length !== 16) throw new Error("rfq_id must be 16 bytes");
+  const h = bytesToHex(bytes);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
