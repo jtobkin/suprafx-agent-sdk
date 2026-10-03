@@ -26,6 +26,8 @@ export type {
   OracleQuote,
   SupraFxErrorCode,
   SupraFxErrorAction,
+  ConsensusParams,
+  MyOpenOrders,
 } from "./client.js";
 
 // Commit lifecycle: `ok` is an ingress signal, `lifecycle` is the truth.
@@ -45,6 +47,13 @@ export type { PreflightResult, Check, CheckStatus } from "./mcp/preflight.js";
 
 export { DelegateSigner } from "./signer.js";
 export type { DelegateSignerOptions } from "./signer.js";
+export {
+  DEFAULT_EXPIRY_BATCHES,
+  MAX_EXPIRY_BATCHES,
+  MIN_EXPIRY_LEAD_BATCHES,
+  MIN_SAFE_EXPIRY_BATCHES,
+  WEBSITE_EXPIRY_BUFFER_BATCHES,
+} from "./expiry.js";
 
 // Re-export BCS + derivation utilities so power users can compose
 // custom flows without re-vendoring the council libs.

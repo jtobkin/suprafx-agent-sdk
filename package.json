@@ -1,6 +1,6 @@
 {
   "name": "suprafx-agent-sdk",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "SDK + MCP server for building autonomous agents on SupraFX",
   "license": "MIT",
   "repository": {
@@ -36,7 +36,7 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "mcp": "node dist/bin/suprafx-mcp.js",
-    "test": "npx tsx --test test/*.test.ts src/mcp/*.test.ts"
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js .test-dist/src/mcp/*.test.js"
   },
   "type": "module",
   "engines": {

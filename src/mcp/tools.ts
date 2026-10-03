@@ -35,6 +35,12 @@ import {
   type CommitResult,
 } from "./lifecycle.js";
 import { runPreflight, ORACLE_STALE_MS } from "./preflight.js";
+import {
+  DEFAULT_EXPIRY_BATCHES,
+  MAX_EXPIRY_BATCHES,
+  MIN_SAFE_EXPIRY_BATCHES,
+  readLockReleaseState,
+} from "../expiry.js";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -87,10 +93,9 @@ const ACK_NOTE =
   "to acknowledge each write.";
 
 const GHOST_LOCK_NOTE =
-  "TRAP — ghost locks: collateral can stay locked with no order visibly " +
-  "holding it (expiry and other-maker-accepted paths do not always release). " +
   "`list_my_open_orders` shows every order of yours that is still holding " +
-  "funds, which is what tells a real lock apart from a ghost one.";
+  "funds. Once on-chain expiry is live, expired/unfillable RFQs and losing " +
+  "quotes auto-release; a remaining lock with no listed order should be reported.";
 
 const PRECONDITIONS =
   "Preconditions: delegate configured, active on-chain policy, and " +
@@ -311,7 +316,7 @@ const readTools: ToolDef[] = [
       properties: {
         chain: {
           type: "string",
-          description: "Chain the deposit was sent on, e.g. `supra`, `ethereum`. Required with `tx_hash`.",
+          description: "Chain the deposit was sent on: `supra`, `ethereum`, `robinhood`, `arc` or `tempo`. Required with `tx_hash`.",
         },
         tx_hash: {
           type: "string",
@@ -382,61 +387,15 @@ const readTools: ToolDef[] = [
           "set SUPRAFX_MASTER_ADDRESS, or pass `address` — see `get_master_address`",
         );
       }
-      const me = address.toLowerCase();
-      const rows = [
-        ...(await ctx.client.getOrderbook({ status: "open", limit: 200 })),
-        ...(await ctx.client.getOrderbook({ status: "expired", limit: 200 })),
-      ];
-      const myRfqs: unknown[] = [];
-      const myQuotes: unknown[] = [];
-      for (const r of rows as any[]) {
-        const expired = r.expires_at ? Date.parse(r.expires_at) < Date.now() : false;
-        if (String(r.taker_address ?? "").toLowerCase() === me) {
-          myRfqs.push({
-            rfq_id: r.id,
-            role: "taker",
-            pair: r.pair,
-            size: r.size,
-            remaining_size: r.remaining_size,
-            status: r.status,
-            expires_at: r.expires_at,
-            expired,
-            holds_collateral: true,
-            release_with: `cancel_rfq({ rfq_id: "${r.id}", acknowledged: true })`,
-          });
-        }
-        for (const q of (r.quotes ?? []) as any[]) {
-          if (String(q.maker_address ?? "").toLowerCase() !== me) continue;
-          if (q.status && !["open", "pending", "active"].includes(String(q.status))) continue;
-          myQuotes.push({
-            quote_id: q.id,
-            role: "maker",
-            on_rfq: r.id,
-            pair: r.pair,
-            rate: q.rate,
-            status: q.status,
-            parent_rfq_status: r.status,
-            parent_rfq_expired: expired,
-            holds_collateral: true,
-            release_with: `withdraw_quote({ quote_id: "${q.id}", acknowledged: true })`,
-          });
-        }
-      }
-      const balances = await ctx.client.getBalances(address).catch(() => []);
-      const total = myRfqs.length + myQuotes.length;
+      const orders = await ctx.client.listMyOpenOrders(address);
+      const total = orders.rfqs.length + orders.quotes.length;
       return {
-        address,
-        open_rfqs_as_taker: myRfqs,
-        open_quotes_as_maker: myQuotes,
+        address: orders.address,
+        open_rfqs_as_taker: orders.rfqs,
+        open_quotes_as_maker: orders.quotes,
         total_open: total,
-        locked_balances: balances
-          .filter((b) => (b.locked_in_rfq ?? 0) > 0 || (b.locked_in_orders ?? 0) > 0)
-          .map((b) => ({
-            asset: b.asset,
-            available: b.available,
-            locked_in_rfq: b.locked_in_rfq,
-            locked_in_orders: b.locked_in_orders,
-          })),
+        locked_balances: { rfqs: orders.lockedRfqs, quotes: orders.lockedOrders },
+        closed_statuses: ["expired", "unfillable"],
         note:
           total === 0
             ? "No open orders of yours. If balances still show locked funds, that " +
@@ -474,8 +433,8 @@ const readTools: ToolDef[] = [
       "Run every check that decides whether it is safe to trade right now, " +
       "each with the ACTION that clears it: venue reachable, venue batch " +
       "actually advancing (not just the L1), venue assets resolving to " +
-      "registered ids, oracle freshness, custody, sequence drift, funding, " +
-      "and stale own-RFQs still holding collateral. Run on connect and after " +
+      "registered ids, on-chain expiry activation, oracle freshness, custody, " +
+      "sequence drift, funding, and open-order locks. Run on connect and after " +
       "any surprise. `ready_to_trade:false` means stop and read `checks`.",
     inputSchema: {
       type: "object",
@@ -507,7 +466,7 @@ const writeTools: ToolDef[] = [
     description:
       "Sign and submit a SubmitRfq — become the taker on a new RFQ. " +
       "LOCKS `size` of `sell_token` from the master's available balance " +
-      "until it matches, expires (30 min default), or you cancel it. " +
+      "until it matches, expires (545 batches by default), or you cancel it. " +
       `${OK_IS_NOT_COMMITTED} ` +
       "Confirmed by reading the RFQ back off the orderbook. " +
       "TRAP — an RFQ with an already-past expiry, or min_fill_size > size, " +
@@ -546,9 +505,9 @@ const writeTools: ToolDef[] = [
           enum: ["Platform", "OnChain"],
           description: "Platform (recommended) for fast internal settle, OnChain for L1 settle",
         },
-        expires_in_minutes: {
+        expires_in_batches: {
           type: "number",
-          description: "Minutes until the RFQ expires (default 30)",
+          description: "Council batches until expiry (minimum 12, default 545, maximum 200000)",
         },
         allow_partial_fills: { type: "boolean", description: "Default false" },
         min_fill_size: {
@@ -577,7 +536,7 @@ const writeTools: ToolDef[] = [
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
       requireAck(args, ctx, "submit_rfq");
-      const expiresInMinutes = assertRfqIsFillable(args);
+      const expiresInBatches = assertRfqIsFillable(args);
       const assets = await ctx.client.listAssets();
       const baseDec = assetDecimals(assets, args.sell_chain, args.sell_token);
       const quoteDec = assetDecimals(assets, args.buy_chain, args.buy_token);
@@ -589,11 +548,10 @@ const writeTools: ToolDef[] = [
         args.buy_chain,
         args.buy_token,
       );
-      const currentBatch = BigInt(await ctx.client.getCurrentBatch());
       const clockOffsetMs = await ctx.client.getVenueClockOffsetMs();
       warnIfClockSkewed(clockOffsetMs);
       const expiresAtMs = BigInt(
-        Date.now() + clockOffsetMs + expiresInMinutes * 60 * 1000,
+        Date.now() + clockOffsetMs + expiresInBatches * 3_300,
       );
       const allowPartial = !!args.allow_partial_fills;
       const rfqIdBytes = randomBytes16();
@@ -616,6 +574,7 @@ const writeTools: ToolDef[] = [
         rfq_id: rfqIdBytes,
         settlement_mode:
           args.settlement_mode === "OnChain" ? "OnChain" : "Platform",
+        expires_in_batches: expiresInBatches,
       });
       const commit = await withLifecycle(res, {
         verifiedBy: `get_orderbook for rfq_id ${rfqUuid}`,
@@ -653,6 +612,10 @@ const writeTools: ToolDef[] = [
           description:
             "Total amount of quote_asset you'll pay across this fill (human units). E.g. 1200 USDC for 0.5 ETH at $2400.",
         },
+        expires_in_batches: {
+          type: "number",
+          description: "Council batches until expiry (minimum 12, default 545, maximum 200000; capped at the parent RFQ expiry)",
+        },
       },
       required: ["rfq_id", "fill_size", "total_payment"],
     },
@@ -679,6 +642,27 @@ const writeTools: ToolDef[] = [
           "it may have matched, expired or been cancelled — re-read `get_orderbook`",
         );
       }
+      const lockRelease = await readLockReleaseState(ctx.client);
+      const parentBatch = parent.council_batch_number == null
+        ? null
+        : BigInt(parent.council_batch_number);
+      const parentPredatesActivation =
+        lockRelease.activationBatch !== null &&
+        (parentBatch === null || parentBatch < lockRelease.activationBatch);
+      if (
+        lockRelease.live &&
+        parent.expires_at_batch == null &&
+        parentPredatesActivation
+      ) {
+        throw new ToolError(
+          "RFQ_FROZEN_FOR_UPGRADE",
+          "this pre-upgrade RFQ has no on-chain expiry and cannot receive a quote",
+          "refresh the orderbook and choose an RFQ created after expiry activation",
+        );
+      }
+      const expiresInBatches = assertExpiryBatches(
+        args.expires_in_batches ?? DEFAULT_EXPIRY_BATCHES,
+      );
       // pair is "BASE/QUOTE" e.g. "ETH/USDC". RFQ rows carry CANONICAL
       // chain ids ("eth-mainnet") while /api/assets carries SHORT ones
       // ("ethereum") — comparing them raw never matched, so this threw on
@@ -708,6 +692,8 @@ const writeTools: ToolDef[] = [
         quote_id: quoteIdBytes,
         rate: toRateBFT(impliedRate, baseDec, quoteDec),
         fill_size: toMicroUnits(args.fill_size, baseDec),
+        expires_in_batches: expiresInBatches,
+        parent_expires_at_batch: parent.expires_at_batch ?? undefined,
       });
       const commit = await withLifecycle(res, {
         verifiedBy: `get_orderbook — quote ${quoteUuid} on rfq ${parent.id}`,
@@ -767,7 +753,7 @@ const writeTools: ToolDef[] = [
         ...commit,
         next_step:
           "Re-read get_balances and confirm the locked amount returned to " +
-          "available. Locks do not always release on their own.",
+          "available. Re-read balances instead of assuming the write committed.",
       };
     },
   },
@@ -980,14 +966,9 @@ function requireAck(args: any, ctx: ToolContext, toolName: string): void {
 
 /** Reject an RFQ that could never fill but would still lock collateral. */
 function assertRfqIsFillable(args: any): number {
-  const expiresInMinutes = args.expires_in_minutes ?? 30;
-  if (!(expiresInMinutes > 0)) {
-    throw new ToolError(
-      "RFQ_DEAD_ON_ARRIVAL",
-      `expires_in_minutes must be > 0 (got ${expiresInMinutes})`,
-      "an already-expired RFQ can commit and lock collateral nobody can fill — pass a positive expiry",
-    );
-  }
+  const expiresInBatches = assertExpiryBatches(
+    args.expires_in_batches ?? DEFAULT_EXPIRY_BATCHES,
+  );
   if (!(args.size > 0)) {
     throw new ToolError(
       "RFQ_DEAD_ON_ARRIVAL",
@@ -1002,7 +983,23 @@ function assertRfqIsFillable(args: any): number {
       "no fill could satisfy it, but the RFQ would still lock funds — lower min_fill_size",
     );
   }
-  return expiresInMinutes;
+  return expiresInBatches;
+}
+
+function assertExpiryBatches(value: unknown): number {
+  const batches = Number(value);
+  if (
+    !Number.isInteger(batches) ||
+    batches < MIN_SAFE_EXPIRY_BATCHES ||
+    batches > MAX_EXPIRY_BATCHES
+  ) {
+    throw new ToolError(
+      "RFQ_DEAD_ON_ARRIVAL",
+      `expires_in_batches must be a whole number from ${MIN_SAFE_EXPIRY_BATCHES} to ${MAX_EXPIRY_BATCHES} (got ${String(value)})`,
+      `use ${DEFAULT_EXPIRY_BATCHES} for the default order lifetime`,
+    );
+  }
+  return batches;
 }
 
 let uniqueReasonCounter = 0;
@@ -1088,6 +1085,11 @@ async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupChe
       detail: "requires a master address returned by the delegate-policy endpoint",
       remedy: "suprafx-mcp init",
     },
+    on_chain_expiry: {
+      status: "unknown",
+      detail: "expiry activation not checked yet",
+      remedy: "read /api/council/consensus-params",
+    },
   };
 
   try {
@@ -1102,6 +1104,28 @@ async function getSetupStatus(ctx: ToolContext): Promise<Record<string, SetupChe
       status: "fail",
       detail: errorMessage(e),
       remedy: "curl -f https://suprafx.ai/api/council/chain-info",
+    };
+  }
+
+  try {
+    const [params, batch] = await Promise.all([
+      ctx.client.getConsensusParams(),
+      ctx.client.getCurrentBatch(),
+    ]);
+    const activation = BigInt(params.fleet_must_match.lock_release_activation_batch);
+    const live = activation !== BigInt("18446744073709551615") && BigInt(batch + 1) >= activation;
+    report.on_chain_expiry = {
+      status: "ok",
+      detail: live
+        ? `on-chain expiry is live (activation batch ${activation}, current batch ${batch})`
+        : `on-chain expiry is not live yet (activation batch ${activation}, current batch ${batch})`,
+      remedy: "do not guess the switch height; re-read consensus-params",
+    };
+  } catch (e) {
+    report.on_chain_expiry = {
+      status: "unknown",
+      detail: errorMessage(e),
+      remedy: "read /api/council/consensus-params",
     };
   }
 

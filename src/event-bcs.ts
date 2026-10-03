@@ -196,6 +196,9 @@ const TAG_DELEGATE_POLICY_REVOKED = 22;
 // LinkedAddressRevoked = enum index 25 (Rust Event variant order:
 // see council-rust/crates/protocol/src/events.rs).
 const TAG_LINKED_ADDRESS_REVOKED = 25;
+/** Appended order-expiry variants; values are locked to the Rust enum. */
+export const TAG_SUBMIT_RFQ_V2 = 36;
+export const TAG_PLACE_QUOTE_V2 = 37;
 
 // ─── Domain types (mirror Rust) ───────────────────────────────────
 
@@ -257,6 +260,10 @@ export interface SubmitRfqEvent {
   settlement_mode: SettlementMode;
 }
 
+export interface SubmitRfqV2Event extends SubmitRfqEvent {
+  expires_at_batch: bigint;
+}
+
 /** `CancelRfq` payload. */
 export interface CancelRfqEvent {
   user: Uint8Array;
@@ -272,6 +279,10 @@ export interface PlaceQuoteEvent {
   rate: bigint;
   fill_size: bigint;
   user_sequence_number: bigint;
+}
+
+export interface PlaceQuoteV2Event extends PlaceQuoteEvent {
+  expires_at_batch: bigint;
 }
 
 /** `AcceptQuote` payload. Note: `taker` field, plus `trade_id` (NOT `rfq_id`). */
@@ -404,6 +415,11 @@ function writeSubmitRfq(w: BcsWriter, e: SubmitRfqEvent): void {
   writeSettlementMode(w, e.settlement_mode);
 }
 
+function writeSubmitRfqV2(w: BcsWriter, e: SubmitRfqV2Event): void {
+  writeSubmitRfq(w, e);
+  w.u64(e.expires_at_batch);
+}
+
 function writeCancelRfq(w: BcsWriter, e: CancelRfqEvent): void {
   w.fixed(e.user, 32, "user");
   w.fixed(e.rfq_id, 16, "rfq_id");
@@ -417,6 +433,12 @@ function writePlaceQuote(w: BcsWriter, e: PlaceQuoteEvent): void {
   w.u128(e.rate);
   w.u128(e.fill_size);
   w.u64(e.user_sequence_number);
+}
+
+
+function writePlaceQuoteV2(w: BcsWriter, e: PlaceQuoteV2Event): void {
+  writePlaceQuote(w, e);
+  w.u64(e.expires_at_batch);
 }
 
 function writeAcceptQuote(w: BcsWriter, e: AcceptQuoteEvent): void {
@@ -596,8 +618,10 @@ function writeLinkedAddressRevoked(
 export type UserEvent =
   | { kind: "DepositCredited"; payload: DepositCreditedEvent }
   | { kind: "SubmitRfq"; payload: SubmitRfqEvent }
+  | { kind: "SubmitRfqV2"; payload: SubmitRfqV2Event }
   | { kind: "CancelRfq"; payload: CancelRfqEvent }
   | { kind: "PlaceQuote"; payload: PlaceQuoteEvent }
+  | { kind: "PlaceQuoteV2"; payload: PlaceQuoteV2Event }
   | { kind: "AcceptQuote"; payload: AcceptQuoteEvent }
   | { kind: "WithdrawQuote"; payload: WithdrawQuoteEvent }
   | { kind: "WithdrawRequested"; payload: WithdrawRequestedEvent }
@@ -621,6 +645,10 @@ export function encodeUserEvent(ev: UserEvent): Uint8Array {
       w.uleb128(TAG_SUBMIT_RFQ);
       writeSubmitRfq(w, ev.payload);
       break;
+    case "SubmitRfqV2":
+      w.uleb128(TAG_SUBMIT_RFQ_V2);
+      writeSubmitRfqV2(w, ev.payload);
+      break;
     case "CancelRfq":
       w.uleb128(TAG_CANCEL_RFQ);
       writeCancelRfq(w, ev.payload);
@@ -628,6 +656,10 @@ export function encodeUserEvent(ev: UserEvent): Uint8Array {
     case "PlaceQuote":
       w.uleb128(TAG_PLACE_QUOTE);
       writePlaceQuote(w, ev.payload);
+      break;
+    case "PlaceQuoteV2":
+      w.uleb128(TAG_PLACE_QUOTE_V2);
+      writePlaceQuoteV2(w, ev.payload);
       break;
     case "AcceptQuote":
       w.uleb128(TAG_ACCEPT_QUOTE);
@@ -811,6 +843,10 @@ function readSubmitRfq(r: BcsReader): SubmitRfqEvent {
   };
 }
 
+function readSubmitRfqV2(r: BcsReader): SubmitRfqV2Event {
+  return { ...readSubmitRfq(r), expires_at_batch: r.u64() };
+}
+
 function readCancelRfq(r: BcsReader): CancelRfqEvent {
   return {
     user: r.fixed(32),
@@ -828,6 +864,10 @@ function readPlaceQuote(r: BcsReader): PlaceQuoteEvent {
     fill_size: r.u128(),
     user_sequence_number: r.u64(),
   };
+}
+
+function readPlaceQuoteV2(r: BcsReader): PlaceQuoteV2Event {
+  return { ...readPlaceQuote(r), expires_at_batch: r.u64() };
 }
 
 function readAcceptQuote(r: BcsReader): AcceptQuoteEvent {
@@ -1015,11 +1055,17 @@ export function decodeUserEvent(bcs: Uint8Array): UserEvent | null {
     case TAG_SUBMIT_RFQ:
       result = { kind: "SubmitRfq", payload: readSubmitRfq(r) };
       break;
+    case TAG_SUBMIT_RFQ_V2:
+      result = { kind: "SubmitRfqV2", payload: readSubmitRfqV2(r) };
+      break;
     case TAG_CANCEL_RFQ:
       result = { kind: "CancelRfq", payload: readCancelRfq(r) };
       break;
     case TAG_PLACE_QUOTE:
       result = { kind: "PlaceQuote", payload: readPlaceQuote(r) };
+      break;
+    case TAG_PLACE_QUOTE_V2:
+      result = { kind: "PlaceQuoteV2", payload: readPlaceQuoteV2(r) };
       break;
     case TAG_ACCEPT_QUOTE:
       result = { kind: "AcceptQuote", payload: readAcceptQuote(r) };

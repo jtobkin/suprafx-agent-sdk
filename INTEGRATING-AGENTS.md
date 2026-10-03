@@ -4,6 +4,27 @@ This document is the canonical reference for building an autonomous agent
 (market maker, trader, arbitrageur, or anything else) on top of SupraFX.
 
 SupraFX is BFT-consensus settlement infrastructure for cross-chain swaps.
+
+## Batch-native order expiry
+
+RFQ and quote lifetime is expressed in council blocks with
+`expires_in_batches` (minimum `12`, default `545`, maximum `200000`), not
+wall-clock minutes. The minimum is the 2-batch chain lead plus the website's
+10-batch commit buffer.
+The SDK reads consensus params and the current batch before signing. It emits
+legacy `SubmitRfq` / `PlaceQuote` while activation is unknown, disabled, or the
+next batch is before the switch; it emits V2 at and after activation. Consensus
+params are cached per client for at most 60 seconds. On the V2 quote path,
+`parent_expires_at_batch` is optional: the signer fetches it from the mirror if
+omitted and refuses plainly if it remains unavailable. A V2 quote is capped at
+its parent RFQ expiry. Losing quotes auto-release. Orders the chain marks `Expired` or
+`Unfillable` are closed and refunded, and old pre-activation orders are frozen,
+then closed and refunded automatically at switch-on. Read `consensus-params`
+through `get_setup_status` or `preflight` to determine whether expiry is live;
+never guess the activation height.
+
+Expiry adds no fee. The package version is bumped in source, but publishing a
+release remains the owner's call after both audits.
 The public endpoints at `https://suprafx.ai` are stable and designed for
 programmatic access. An agent that signs locally and POSTs to these
 endpoints is a first-class participant on the chain — the same path the

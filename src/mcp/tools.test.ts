@@ -155,16 +155,16 @@ test("submit_rfq uses venue-aligned expiry and warns only beyond 60 seconds", as
     buy_token: "USDC",
     size: 1,
     reference_price: 2000,
-    expires_in_minutes: 30,
+    expires_in_batches: 545,
   };
   try {
     await tool.handler(args, { client, signer, mode: "autonomous" as const });
-    assert.equal(expiries[0], 2_860_000n);
+    assert.equal(expiries[0], 2_858_500n);
     assert.deepEqual(warnings, []);
 
     offsetMs = 60_001;
     await tool.handler(args, { client, signer, mode: "autonomous" as const });
-    assert.equal(expiries[1], 2_860_001n);
+    assert.equal(expiries[1], 2_858_501n);
     assert.deepEqual(warnings, [
       "local clock skewed by 61s vs venue; using server-aligned expiry",
     ]);

@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import { canonicalChain, deriveAssetId, registeredAssetId } from "../src/derive-ids.js";
 import { SupraFxClient, SupraFxError } from "../src/client.js";
 import { DelegateSigner } from "../src/signer.js";
+import { decodeUserEvent } from "../src/event-bcs.js";
+import { decodeEnvelopeBcs } from "../src/sign-event.js";
 import { sameId, withLifecycle } from "../src/mcp/lifecycle.js";
 import { resolveMode, resolveToolGroups } from "../src/mcp/config.js";
 import { allTools, findTool, ToolError } from "../src/mcp/tools.js";
@@ -128,6 +130,37 @@ test("getOrderbook still accepts a legacy { rfqs } body", async () => {
   assert.equal((await client.getOrderbook()).length, 1);
 });
 
+test("getRfqById uses the exact public id lookup", async () => {
+  const client = new SupraFxClient({ baseUrl: "http://stub.invalid" });
+  const requested: string[] = [];
+  const row = { id: "0e0e0e0e-0e0e-0e0e-0e0e-0e0e0e0e0e0e" };
+  (client as any).get = async (path: string) => {
+    requested.push(path);
+    return { success: true, rfq: row, data: [row] };
+  };
+  assert.equal(await client.getRfqById(row.id), row);
+  assert.deepEqual(requested, [`/api/suprafx/rfqs?id=${row.id}`]);
+});
+
+test("getConsensusParams caches per client for no longer than 60 seconds", async () => {
+  const client = new SupraFxClient({ baseUrl: "http://stub.invalid" });
+  let reads = 0;
+  (client as any).get = async () => {
+    reads += 1;
+    return { fleet_must_match: { lock_release_activation_batch: "100" } };
+  };
+  const before = Date.now();
+  await client.getConsensusParams();
+  await client.getConsensusParams();
+  assert.equal(reads, 1);
+  const cached = (client as any).cachedConsensusParams;
+  assert.ok(cached.expiresAtMs > before);
+  assert.ok(cached.expiresAtMs - before <= 60_000);
+  cached.expiresAtMs = Date.now();
+  await client.getConsensusParams();
+  assert.equal(reads, 2);
+});
+
 // ── B1c: the sequence-desync gate ──────────────────────────────
 
 test("a cancel or quote-withdrawal does NOT advance the sequence counter", async () => {
@@ -141,6 +174,7 @@ test("a cancel or quote-withdrawal does NOT advance the sequence counter", async
     threshold: 1,
   });
   (client as any).submitEnvelope = async () => ({ ok: true });
+  (client as any).getCurrentBatch = async () => 100;
   const signer = new DelegateSigner({ delegatePrivKeyHex: "11".repeat(32), client });
 
   const before = signer.getNextSeq();
@@ -175,6 +209,7 @@ test("submit→cancel→submit leaves the counter exactly 2 ahead, not 3", async
     threshold: 1,
   });
   (client as any).submitEnvelope = async () => ({ ok: true });
+  (client as any).getCurrentBatch = async () => 100;
   const signer = new DelegateSigner({ delegatePrivKeyHex: "22".repeat(32), client });
   const rfq = {
     pair: new Uint8Array(32),
@@ -195,6 +230,65 @@ test("submit→cancel→submit leaves the counter exactly 2 ahead, not 3", async
   await signer.cancelRfq({ rfq_id: new Uint8Array(16), reason: "x" });
   await signer.submitRfq(rfq as any);
   assert.equal(signer.getNextSeq(), start + 2n);
+});
+
+test("a website 409 refusal is retried with the same delegate sequence", async () => {
+  const client = new SupraFxClient({ baseUrl: "http://stub.invalid" });
+  (client as any).getChainInfo = async () => ({
+    chainId: "t",
+    chainIdHashHex: "00".repeat(32),
+    threshold: 1,
+  });
+  (client as any).getCurrentBatch = async () => 100;
+  (client as any).getConsensusParams = async () => ({
+    fleet_must_match: { lock_release_activation_batch: "100" },
+  });
+  const seenSequences: bigint[] = [];
+  let attempt = 0;
+  (client as any).submitEnvelope = async (
+    _endpoint: string,
+    _field: string,
+    envelopeHex: string,
+  ) => {
+    const envelope = decodeEnvelopeBcs(Buffer.from(envelopeHex, "hex"));
+    const event = decodeUserEvent(envelope.event_bcs);
+    assert.equal(event?.kind, "SubmitRfqV2");
+    if (event?.kind === "SubmitRfqV2") {
+      seenSequences.push(event.payload.user_sequence_number);
+    }
+    attempt += 1;
+    return attempt === 1
+      ? {
+          ok: false,
+          code: "expiry_too_near",
+          reason: "Choose an expiry at least 12 batches ahead.",
+        }
+      : { ok: true };
+  };
+  const signer = new DelegateSigner({ delegatePrivKeyHex: "33".repeat(32), client });
+  const rfq = {
+    pair: new Uint8Array(32),
+    base_asset: new Uint8Array(32),
+    quote_asset: new Uint8Array(32),
+    size: 1n,
+    reference_price: 1n,
+    auto_accept: false,
+    auto_accept_target_rate: 0n,
+    allow_partial_fills: false,
+    min_fill_size: 0n,
+    expires_at_ms: 1n,
+    rfq_id: new Uint8Array(16),
+    settlement_mode: "Platform" as const,
+  };
+
+  const refused = await signer.submitRfq(rfq);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, "Choose an expiry at least 12 batches ahead.");
+  assert.equal(signer.getNextSeq(), 0n);
+  const accepted = await signer.submitRfq(rfq);
+  assert.equal(accepted.ok, true);
+  assert.deepEqual(seenSequences, [0n, 0n]);
+  assert.equal(signer.getNextSeq(), 1n);
 });
 
 // ── C1: the ID-casing false negative ───────────────────────────
@@ -351,7 +445,8 @@ test("an RFQ that could never fill is refused client-side, not left holding coll
     size: 1, reference_price: 1,
   };
   for (const bad of [
-    { ...base, expires_in_minutes: 0 },
+    { ...base, expires_in_batches: 1 },
+    { ...base, expires_in_batches: 11 },
     { ...base, allow_partial_fills: true, min_fill_size: 5 },
     { ...base, size: 0 },
   ]) {
@@ -365,6 +460,78 @@ test("an RFQ that could never fill is refused client-side, not left holding coll
       `should refuse ${JSON.stringify(bad)}`,
     );
   }
+});
+
+test("place_quote freezes a no-expiry parent only at activation, never before it", async () => {
+  const tool = findTool("place_quote", true)!;
+  let currentBatch = 98;
+  let signed = 0;
+  const parent: any = {
+    id: "0e0e0e0e-0e0e-0e0e-0e0e-0e0e0e0e0e0e",
+    taker_address: "0xtaker",
+    pair: "SUPRA/USDC",
+    size: 2,
+    remaining_size: 2,
+    source_chain: "supra",
+    dest_chain: "ethereum",
+    reference_price: 1,
+    status: "open",
+    settlement_mode: "platform",
+    allow_partial_fills: true,
+    min_fill_size: 1,
+    expires_at: "",
+    created_at: "",
+    expires_at_batch: null,
+  };
+  const client = {
+    getOrderbook: async () => [parent],
+    getConsensusParams: async () => ({
+      fleet_must_match: { lock_release_activation_batch: "100" },
+    }),
+    getCurrentBatch: async () => currentBatch,
+    listAssets: async () => [
+      { chain_id: "supra", asset_symbol: "SUPRA", contract_address: null, decimals: 8 },
+      { chain_id: "ethereum", asset_symbol: "USDC", contract_address: null, decimals: 6 },
+    ],
+  } as any;
+  const signer = {
+    placeQuote: async () => {
+      signed += 1;
+      return { ok: false, code: "decode_error" };
+    },
+  } as any;
+  const args = {
+    rfq_id: parent.id,
+    fill_size: 1,
+    total_payment: 1,
+    acknowledged: true,
+  };
+  const ctx = {
+    client,
+    signer,
+    mode: "autonomous" as const,
+    groups: new Set(["read", "trade", "cancel"]),
+  };
+
+  await tool.handler(args, ctx);
+  assert.equal(signed, 1, "target H-1 must continue through the V1 signer path");
+
+  currentBatch = 99;
+  parent.council_batch_number = "100";
+  await tool.handler(args, ctx);
+  assert.equal(signed, 2, "a parent created at H is not a frozen legacy parent");
+
+  parent.council_batch_number = null;
+  await assert.rejects(
+    () => tool.handler(args, ctx),
+    (error: unknown) => {
+      assert.ok(error instanceof ToolError);
+      assert.equal((error as ToolError).code, "RFQ_FROZEN_FOR_UPGRADE");
+      assert.match((error as Error).message, /pre-upgrade RFQ/);
+      return true;
+    },
+  );
+  assert.equal(signed, 2, "target H must freeze the legacy parent before signing");
 });
 
 // ── C1: structured errors ──────────────────────────────────────
