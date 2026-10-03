@@ -316,7 +316,7 @@ const readTools: ToolDef[] = [
       properties: {
         chain: {
           type: "string",
-          description: "Chain the deposit was sent on, e.g. `supra`, `ethereum`. Required with `tx_hash`.",
+          description: "Chain the deposit was sent on: `supra`, `ethereum`, `robinhood`, `arc` or `tempo`. Required with `tx_hash`.",
         },
         tx_hash: {
           type: "string",
