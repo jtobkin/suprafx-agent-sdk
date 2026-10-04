@@ -143,7 +143,7 @@ limits beyond the delegate's on-chain caps — keep those **conservative**
 while testing:
 - `max_trade_size`: a small dollar value
 - `max_earmark_total`: a small dollar value (your real overspend backstop)
-- `expires_at_batch`: ~24h of batches (≈ `86_400`)
+- `expires_at_batch`: ~24h ahead — `get_current_batch` + about `25_000` (batches are ~3.5 s apart as of 2026-10; `86_400` is ~3.5 days, not 24h). Measure the live rate with two `get_current_batch` reads a minute apart.
 
 Loosen once you've watched the agent behave for a few hours.
 
