@@ -52,8 +52,11 @@ export {
   MAX_EXPIRY_BATCHES,
   MIN_EXPIRY_LEAD_BATCHES,
   MIN_SAFE_EXPIRY_BATCHES,
+  TARGET_ORDER_LIFETIME_SECONDS,
   WEBSITE_EXPIRY_BUFFER_BATCHES,
+  resolveDefaultExpiryBatches,
 } from "./expiry.js";
+export type { DefaultExpiry, ExpiryRecommendationReader } from "./expiry.js";
 
 // Re-export BCS + derivation utilities so power users can compose
 // custom flows without re-vendoring the council libs.

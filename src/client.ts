@@ -323,6 +323,19 @@ export class SupraFxClient {
     return j.current_batch;
   }
 
+  /**
+   * The venue's default expiry: about 30 minutes of wall-clock time at the
+   * chain's measured block pace, as a batch count. Not cached: the pace moves.
+   */
+  async getRecommendedExpiry(): Promise<{
+    use_v2: boolean;
+    expires_at_batch?: string;
+    lifetime_batches?: number;
+    seconds_per_batch?: number;
+  }> {
+    return await this.get("/api/council/submit-rfq");
+  }
+
   /** Public chain expiry constants reported by the rolled venue fleet. */
   async getConsensusParams(): Promise<ConsensusParams> {
     const now = Date.now();

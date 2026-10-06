@@ -463,8 +463,13 @@ Open an issue on the repo, or reach out via the Discord linked from
 `suprafx.ai`.
 ### Batch expiry and automatic refunds
 
-`submit_rfq` and `place_quote` use `expires_in_batches` (minimum `12`, default
-`545`, maximum `200000`). The signer reads the activation parameter and current
+`submit_rfq` and `place_quote` use `expires_in_batches` (minimum `12`, maximum
+`200000`). **Omit it for the default: about 30 minutes of wall-clock time.** The
+SDK asks the venue (`GET /api/council/submit-rfq`) how many batches 30 minutes
+is at the chain's measured pace — blocks are ~0.6 s during Mainnet Beta, so a
+fixed count would drift (545 batches was 30 minutes at 3.3 s; it is ~5 minutes
+now). If the venue cannot answer, the legacy `545` is used; `resolveDefaultExpiryBatches`
+exposes which happened. The signer reads the activation parameter and current
 batch, emits V1 before the switch (and whenever activation is unknown), then V2
 when the next batch reaches activation. Consensus params are cached for at most
 60 seconds. The minimum combines the chain's 2-batch lead with the website's
