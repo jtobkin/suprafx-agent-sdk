@@ -8,8 +8,10 @@ SupraFX is BFT-consensus settlement infrastructure for cross-chain swaps.
 ## Batch-native order expiry
 
 RFQ and quote lifetime is expressed in council blocks with
-`expires_in_batches` (minimum `12`, default `545`, maximum `200000`), not
-wall-clock minutes. The minimum is the 2-batch chain lead plus the website's
+`expires_in_batches` (minimum `12`, maximum `200000`), not wall-clock minutes.
+Omit it for the default: the SDK asks the venue for "about 30 minutes" at the
+chain's current pace and converts that to batches (blocks are ~0.6 s during
+Mainnet Beta, so a fixed count drifts; the legacy `545` is only the fallback). The minimum is the 2-batch chain lead plus the website's
 10-batch commit buffer.
 The SDK reads consensus params and the current batch before signing. It emits
 legacy `SubmitRfq` / `PlaceQuote` while activation is unknown, disabled, or the

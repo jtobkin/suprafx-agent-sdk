@@ -33,10 +33,10 @@ import {
 } from "./sign-event.js";
 import { SupraFxClient, type SubmitResult } from "./client.js";
 import {
-  DEFAULT_EXPIRY_BATCHES,
   MAX_EXPIRY_BATCHES,
   MIN_SAFE_EXPIRY_BATCHES,
   readLockReleaseState,
+  resolveDefaultExpiryBatches,
 } from "./expiry.js";
 
 /** Codes that mean the chain accepted the envelope at mempool but
@@ -179,7 +179,8 @@ export class DelegateSigner {
     Extract<UserEvent, { kind: "SubmitRfqV2" }>["payload"],
     "user_sequence_number" | "user" | "expires_at_batch"
   > & { expires_in_batches?: number }): Promise<SubmitResult> {
-    const { expires_in_batches = DEFAULT_EXPIRY_BATCHES, ...eventPayload } = payload;
+    const { expires_in_batches: requested, ...eventPayload } = payload;
+    const expires_in_batches = requested ?? (await resolveDefaultExpiryBatches(this.client)).batches;
     assertExpiryLifetime(expires_in_batches);
     const lockRelease = await readLockReleaseState(this.client);
     if (!lockRelease.live || lockRelease.targetBatch === null) {
@@ -209,10 +210,11 @@ export class DelegateSigner {
     "user_sequence_number" | "maker" | "expires_at_batch"
   > & { expires_in_batches?: number; parent_expires_at_batch?: bigint | number | string }): Promise<SubmitResult> {
     const {
-      expires_in_batches = DEFAULT_EXPIRY_BATCHES,
+      expires_in_batches: requested,
       parent_expires_at_batch,
       ...eventPayload
     } = payload;
+    const expires_in_batches = requested ?? (await resolveDefaultExpiryBatches(this.client)).batches;
     assertExpiryLifetime(expires_in_batches);
     const lockRelease = await readLockReleaseState(this.client);
     if (!lockRelease.live || lockRelease.targetBatch === null) {

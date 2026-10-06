@@ -36,10 +36,10 @@ import {
 } from "./lifecycle.js";
 import { runPreflight, ORACLE_STALE_MS } from "./preflight.js";
 import {
-  DEFAULT_EXPIRY_BATCHES,
   MAX_EXPIRY_BATCHES,
   MIN_SAFE_EXPIRY_BATCHES,
   readLockReleaseState,
+  resolveDefaultExpiryBatches,
 } from "../expiry.js";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -466,7 +466,8 @@ const writeTools: ToolDef[] = [
     description:
       "Sign and submit a SubmitRfq — become the taker on a new RFQ. " +
       "LOCKS `size` of `sell_token` from the master's available balance " +
-      "until it matches, expires (545 batches by default), or you cancel it. " +
+      "until it matches, expires (default: about 30 minutes of wall-clock time, " +
+      "converted to batches at the chain's live pace), or you cancel it. " +
       `${OK_IS_NOT_COMMITTED} ` +
       "Confirmed by reading the RFQ back off the orderbook. " +
       "TRAP — an RFQ with an already-past expiry, or min_fill_size > size, " +
@@ -507,7 +508,7 @@ const writeTools: ToolDef[] = [
         },
         expires_in_batches: {
           type: "number",
-          description: "Council batches until expiry (minimum 12, default 545, maximum 200000)",
+          description: "Council batches until expiry (minimum 12, maximum 200000). Omit for the default: about 30 minutes at the chain's current block pace (the venue converts time to batches; blocks are ~0.6 s during Mainnet Beta, so a fixed count drifts)",
         },
         allow_partial_fills: { type: "boolean", description: "Default false" },
         min_fill_size: {
@@ -536,7 +537,7 @@ const writeTools: ToolDef[] = [
     handler: async (args, ctx) => {
       const signer = requireSigner(ctx);
       requireAck(args, ctx, "submit_rfq");
-      const expiresInBatches = assertRfqIsFillable(args);
+      const expiresInBatches = await assertRfqIsFillable(args, ctx);
       const assets = await ctx.client.listAssets();
       const baseDec = assetDecimals(assets, args.sell_chain, args.sell_token);
       const quoteDec = assetDecimals(assets, args.buy_chain, args.buy_token);
@@ -614,7 +615,7 @@ const writeTools: ToolDef[] = [
         },
         expires_in_batches: {
           type: "number",
-          description: "Council batches until expiry (minimum 12, default 545, maximum 200000; capped at the parent RFQ expiry)",
+          description: "Council batches until expiry (minimum 12, maximum 200000; capped at the parent RFQ expiry). Omit for the default: about 30 minutes at the chain's current block pace",
         },
       },
       required: ["rfq_id", "fill_size", "total_payment"],
@@ -661,7 +662,7 @@ const writeTools: ToolDef[] = [
         );
       }
       const expiresInBatches = assertExpiryBatches(
-        args.expires_in_batches ?? DEFAULT_EXPIRY_BATCHES,
+        args.expires_in_batches ?? (await resolveDefaultExpiryBatches(ctx.client)).batches,
       );
       // pair is "BASE/QUOTE" e.g. "ETH/USDC". RFQ rows carry CANONICAL
       // chain ids ("eth-mainnet") while /api/assets carries SHORT ones
@@ -965,9 +966,9 @@ function requireAck(args: any, ctx: ToolContext, toolName: string): void {
 }
 
 /** Reject an RFQ that could never fill but would still lock collateral. */
-function assertRfqIsFillable(args: any): number {
+async function assertRfqIsFillable(args: any, ctx: ToolContext): Promise<number> {
   const expiresInBatches = assertExpiryBatches(
-    args.expires_in_batches ?? DEFAULT_EXPIRY_BATCHES,
+    args.expires_in_batches ?? (await resolveDefaultExpiryBatches(ctx.client)).batches,
   );
   if (!(args.size > 0)) {
     throw new ToolError(
@@ -996,7 +997,7 @@ function assertExpiryBatches(value: unknown): number {
     throw new ToolError(
       "RFQ_DEAD_ON_ARRIVAL",
       `expires_in_batches must be a whole number from ${MIN_SAFE_EXPIRY_BATCHES} to ${MAX_EXPIRY_BATCHES} (got ${String(value)})`,
-      `use ${DEFAULT_EXPIRY_BATCHES} for the default order lifetime`,
+      "omit expires_in_batches for the default order lifetime (about 30 minutes at the chain's current pace)",
     );
   }
   return batches;

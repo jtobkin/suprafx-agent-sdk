@@ -9,7 +9,7 @@ import {
 } from "../src/event-bcs.js";
 import { decodeEnvelopeBcs } from "../src/sign-event.js";
 import { DelegateSigner } from "../src/signer.js";
-import { readLockReleaseState, U64_MAX } from "../src/expiry.js";
+import { readLockReleaseState, resolveDefaultExpiryBatches, U64_MAX } from "../src/expiry.js";
 
 const SUBMIT_RFQ_V2_RUST_BCS =
   "24010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303040404040404040404040404040404040404040404040404040404040404040405000000000000000000000000000000060000000000000000000000000000000107000000000000000000000000000000000800000000000000000000000000000009000000000000000a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0b00000000000000010c00000000000000";
@@ -74,7 +74,65 @@ test("V1 order encoders equal the existing Rust vectors", () => {
   assert.equal(hex(encodeUserEvent(place)), PLACE_QUOTE_V1_RUST_BCS);
 });
 
-test("signer defaults to 545 batches and caps a quote at its parent", async () => {
+test("signer default = the venue's ~30-minute recommendation, capped at the parent", async () => {
+  const submitted: Uint8Array[] = [];
+  const client = {
+    getCurrentBatch: async () => 100,
+    getConsensusParams: async () => ({
+      fleet_must_match: { lock_release_activation_batch: "100" },
+    }),
+    // What the venue answers at ~0.63 s/batch (live 2026-10-06).
+    getRecommendedExpiry: async () => ({ use_v2: true, lifetime_batches: 2855, seconds_per_batch: 0.63 }),
+    getChainInfo: async () => ({ chainIdHashHex: "00".repeat(32) }),
+    getSequenceNumber: async () => 11,
+    submitEnvelope: async (_endpoint: string, _field: string, envelopeHex: string) => {
+      submitted.push(Buffer.from(envelopeHex, "hex"));
+      return { ok: true };
+    },
+  } as any;
+  const resolved = await resolveDefaultExpiryBatches(client);
+  assert.deepEqual(resolved, { batches: 2855, source: "venue", secondsPerBatch: 0.63, approxSeconds: 1799 });
+  const signer = new DelegateSigner({ delegatePrivKeyHex: "11".repeat(32), client });
+  await signer.submitRfq({
+    pair: filled(1, 32), base_asset: filled(2, 32), quote_asset: filled(3, 32),
+    size: 1n, reference_price: 1n, auto_accept: false,
+    auto_accept_target_rate: 0n, allow_partial_fills: false, min_fill_size: 0n,
+    expires_at_ms: 1n, rfq_id: filled(4, 16), settlement_mode: "Platform",
+  });
+  await signer.placeQuote({
+    rfq_id: filled(4, 16), quote_id: filled(5, 16), rate: 1n, fill_size: 1n,
+    parent_expires_at_batch: 400n,
+  });
+  // An explicit number is honoured as-is.
+  await signer.submitRfq({
+    pair: filled(1, 32), base_asset: filled(2, 32), quote_asset: filled(3, 32),
+    size: 1n, reference_price: 1n, auto_accept: false,
+    auto_accept_target_rate: 0n, allow_partial_fills: false, min_fill_size: 0n,
+    expires_at_ms: 1n, rfq_id: filled(4, 16), settlement_mode: "Platform",
+    expires_in_batches: 545,
+  });
+  const first = decodeUserEvent(decodeEnvelopeBcs(submitted[0]).event_bcs);
+  const second = decodeUserEvent(decodeEnvelopeBcs(submitted[1]).event_bcs);
+  const third = decodeUserEvent(decodeEnvelopeBcs(submitted[2]).event_bcs);
+  assert.equal(first?.kind === "SubmitRfqV2" && first.payload.expires_at_batch, 101n + 2855n);
+  assert.equal(second?.kind === "PlaceQuoteV2" && second.payload.expires_at_batch, 400n);
+  assert.equal(third?.kind === "SubmitRfqV2" && third.payload.expires_at_batch, 646n);
+});
+
+test("venue recommendation outside the chain limits, or unreadable, falls back to 545", async () => {
+  for (const rec of [
+    async () => ({ use_v2: true, lifetime_batches: 5 }),
+    async () => ({ use_v2: true, lifetime_batches: 200_001 }),
+    async () => ({ use_v2: false }),
+    async () => { throw new Error("venue down"); },
+  ]) {
+    const resolved = await resolveDefaultExpiryBatches({ getRecommendedExpiry: rec });
+    assert.equal(resolved.batches, 545);
+    assert.equal(resolved.source, "legacy");
+  }
+});
+
+test("signer falls back to 545 batches when the venue has no recommendation endpoint", async () => {
   const submitted: Uint8Array[] = [];
   const client = {
     getCurrentBatch: async () => 100,
